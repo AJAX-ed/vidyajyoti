@@ -1,0 +1,24 @@
+# VidyaJyoti ML Service - Self-Hosted AI Models
+
+# Core ML frameworks
+torch==2.5.1
+transformers==4.47.0
+sentence-transformers==3.3.1
+scikit-learn==1.6.0
+
+# Vector store and embeddings
+faiss-cpu==1.9.0
+pgvector==0.3.6
+
+# FastAPI for ML service
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Database (optional, for storing model metadata)
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+
+# Utilities
+numpy==1.26.4
+pandas==2.2.3
+pydantic==2.10.4
