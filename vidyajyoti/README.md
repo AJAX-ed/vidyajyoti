@@ -108,83 +108,205 @@ The system automatically generates a personalized daily schedule:
 - Points/rewards system
 - Community features
 
-## Setup Instructions
+## 🏃 How to Run — Step by Step
+
+Follow these steps **in order**. You need three services running (PostgreSQL is required; the ML service is optional):
+
+| # | Service | Port | Required? |
+|---|---------|------|-----------|
+| 1 | PostgreSQL database | 5432 | ✅ Yes |
+| 2 | Main backend (FastAPI) | 8000 | ✅ Yes |
+| 3 | Frontend (Vite dev server) | 3000 | ✅ Yes |
+| 4 | ML service (self-hosted AI) | 9000 | ⚪ Optional |
 
 ### Prerequisites
-- Node.js 18+ (LTS recommended)
-- Python 3.11+
-- PostgreSQL 14+
-- Git
+- **Node.js 18+** (latest LTS recommended) — check with `node -v`
+- **Python 3.11+** — check with `python3 --version`
+- **PostgreSQL 14+** running locally — check with `psql --version`
+- **Git**
 
-### 1. Database Setup
+First, clone/download the project and enter the folder:
 
 ```bash
-# Connect to PostgreSQL
-psql -U postgres
-
-# Create database and user
-CREATE DATABASE vidyajyoti;
-CREATE USER vj_user WITH PASSWORD 'vj_password';
-GRANT ALL PRIVILEGES ON DATABASE vidyajyoti TO vj_user;
-
-# Enable pgvector extension (optional, for ML service)
-\c vidyajyoti
-CREATE EXTENSION IF NOT EXISTS vector;
+git clone <your-repo-url> vidyajyoti-app
+cd vidyajyoti-app/vidyajyoti    # the project root that contains frontend/, backend/, backend_ml/, .env
 ```
 
-### 2. Backend Setup
+---
+
+### STEP 1 — Set Up PostgreSQL (required)
+
+Start PostgreSQL if it isn't running, then connect as a superuser:
 
 ```bash
-cd vidyajyoti/backend
+# macOS (Homebrew)
+brew services start postgresql@14
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Ubuntu/Debian
+sudo service postgresql start
+
+# Then connect
+psql -U postgres        # on Linux you may need: sudo -u postgres psql
+```
+
+Inside the `psql` prompt, create the database and user:
+
+```sql
+CREATE USER vj_user WITH PASSWORD 'vj_password';
+CREATE DATABASE vidyajyoti OWNER vj_user;
+\c vidyajyoti
+GRANT ALL ON SCHEMA public TO vj_user;
+
+-- Optional: enable pgvector (only needed later for the ML service's persistent vector store)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+\q
+```
+
+Verify the connection string in `.env` (project root) matches what you created:
+
+```bash
+cat .env
+# DATABASE_URL=postgresql+asyncpg://vj_user:vj_password@localhost:5432/vidyajyoti
+# ML_SERVICE_URL=http://localhost:9000
+```
+
+> 💡 Tip: instead of typing SQL manually, you can run this one-liner from the shell:
+> ```bash
+> psql -U postgres -c "CREATE USER vj_user WITH PASSWORD 'vj_password';" \
+>   && psql -U postgres -c "CREATE DATABASE vidyajyoti OWNER vj_user;" \
+>   && psql -U postgres -d vidyajyoti -c "GRANT ALL ON SCHEMA public TO vj_user;"
+> ```
+
+---
+
+### STEP 2 — Run the Main Backend (FastAPI, port 8000)
+
+From the project root:
+
+```bash
+cd backend
+
+# Create + activate a virtual environment
+python3 -m venv venv
+source venv/bin/activate       # Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Set environment variables (or edit .env)
+# Point the app at your database (the defaults in code already match .env)
 export DATABASE_URL="postgresql+asyncpg://vj_user:vj_password@localhost:5432/vidyajyoti"
 
-# Run the backend
+# Start the server (from backend/, so the `app.` package resolves)
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Backend will be available at: http://localhost:8000
-API docs at: http://localhost:8000/docs
-
-### 3. Frontend Setup
+✅ Verify it works:
 
 ```bash
-cd vidyajyoti/frontend
+curl http://localhost:8000/api/health
+# → {"status":"ok","time":"...","db":"ok"}
+```
+
+- Interactive API docs (Swagger): **http://localhost:8000/docs**
+- Exams list: **http://localhost:8000/api/exams**
+
+Leave this terminal running.
+
+---
+
+### STEP 3 — Run the Frontend (React + Vite, port 3000)
+
+Open a **new terminal**, from the project root:
+
+```bash
+cd frontend
 
 # Install dependencies
 npm install
 
-# Start development server
+# Start the dev server (script already sets host 0.0.0.0 and port 3000)
 npm run dev
 ```
 
-Frontend will be available at: http://localhost:3000
+✅ Open **http://localhost:3000** in your browser.
 
-### 4. ML Service Setup (Optional)
+Expected flow:
+1. **Login page** → click *Login* (mock auth stores `vj_token` in localStorage).
+2. **Onboarding quiz** (7 steps) → answer routine/school/meals/study-preference questions.
+3. On step 6 you'll see the **generated day plan timeline** → click *Start Learning*.
+4. **Dashboard** shows your plan, stats pills, sidebar/bottom nav, and theme toggle.
+
+Leave this terminal running too.
+
+---
+
+### STEP 4 — Run the ML Service (Optional, self-hosted AI, port 9000)
+
+Only needed if you want the AI endpoints (topic recommendations, schedule adjustment, doubt answering). The main app works fully without it (day plans are rule-based).
+
+Open a **third terminal**, from the project root:
 
 ```bash
-cd vidyajyoti/backend_ml
+cd backend_ml
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
+# Create + activate a separate virtual environment (heavy ML deps)
+python3 -m venv venv
+source venv/bin/activate       # Windows: venv\Scripts\activate
 
-# Install dependencies
+# Install PyTorch / Transformers / FAISS etc. (large download)
 pip install -r requirements.txt
 
-# Run ML service
+# Start the ML service (from backend_ml/, so the `app_ml.` package resolves)
 uvicorn app_ml.main:app --host 0.0.0.0 --port 9000 --reload
 ```
 
-ML service will be available at: http://localhost:9000
+✅ Verify:
+
+```bash
+curl http://localhost:9000/health
+```
+
+Available self-hosted AI endpoints (called internally by the main backend via `ML_SERVICE_URL`, never by the browser):
+
+```bash
+curl -X POST http://localhost:9000/api/ml/recommend-next-topic \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": 1, "exam_id": 1}'
+
+curl -X POST http://localhost:9000/api/ml/answer-doubt \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": 1, "subject_id": 1, "question": "What is integration?"}'
+```
+
+---
+
+### STEP 5 — Quick Sanity Check (all services up)
+
+| Check | URL / command | Expected |
+|-------|---------------|----------|
+| Frontend | http://localhost:3000 | VidyaJyoti login page |
+| Backend health | `curl localhost:8000/api/health` | `"status":"ok"` and `"db":"ok"` |
+| Backend docs | http://localhost:8000/docs | Swagger UI |
+| Exams | `curl localhost:8000/api/exams` | JSON list of exams |
+| ML service (opt.) | `curl localhost:9000/health` | OK response |
+
+### Production Build (Frontend)
+
+```bash
+cd frontend
+npm run build      # outputs static files to frontend/dist/
+npm run preview    # serve the built app locally
+```
+
+### Troubleshooting
+
+- **`db: "error"` in /api/health** → PostgreSQL isn't running or credentials mismatch. Re-check STEP 1 and `DATABASE_URL`.
+- **`ModuleNotFoundError: app` / `app_ml`** → run uvicorn from inside `backend/` or `backend_ml/` respectively (not from the project root).
+- **Port already in use** → find & kill the process (`lsof -i :3000` / `:8000` / `:9000`) or change the port in `package.json` script / uvicorn flags.
+- **CORS errors in browser console** → backend must allow `http://localhost:3000` (already configured in `backend/app/main.py`).
+- **`pip install` of ML deps is slow/huge** → expected (PyTorch ≈ 2 GB). Skip STEP 4 if you don't need AI features yet.
+- **Windows users** → use `venv\Scripts\activate` instead of `source venv/bin/activate`.
 
 ## API Endpoints
 
