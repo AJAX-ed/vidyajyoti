@@ -1,7 +1,7 @@
-# Python
+# Logs
+*.log
+.vj_logs/
+
+# Python compiled files
 __pycache__/
 *.pyc
-
-# Logs
-.vj_logs/
-*.log
