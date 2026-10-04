@@ -1,7 +1,10 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-sqlalchemy[asyncio]==2.0.36
-asyncpg==0.30.0
-pydantic==2.10.4
-pydantic-settings==2.7.0
-psycopg2-binary==2.9.10
+# Version ranges (not exact pins) so pip can always find a wheel for
+# ANY OS / Python version combination (e.g. asyncpg 0.30.0 has no Windows
+# wheels for the newest CPython releases — that broke `python runner.py`).
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.34,<0.35
+sqlalchemy[asyncio]>=2.0.36,<2.1
+asyncpg>=0.29
+pydantic>=2.10,<3
+pydantic-settings>=2.7,<3
+psycopg2-binary>=2.9.9

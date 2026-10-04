@@ -1,5 +1,14 @@
-# Compiled and build artifacts
+# Python
 __pycache__/
+*.pyc
 
-# Logs and temp files
+# Virtual Environments
+.venv/
+venv/
+
+# Node Dependencies
+node_modules/
+
+# Logs
 .vj_logs/
+*.log

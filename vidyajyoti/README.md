@@ -307,11 +307,12 @@ npm run preview    # serve the built app locally
 
 ### Troubleshooting
 
+- **`ERROR: No matching distribution found for asyncpg==0.30.0` (Windows)** → FIXED AT THE SOURCE: all `requirements.txt` files now use flexible version ranges (`asyncpg>=0.29`, etc.) instead of exact pins, because pinned releases like `asyncpg==0.30.0` ship no wheels for some Windows/Python combos. Additionally, `runner.py` upgrades pip inside every fresh venv before installing (old bundled pip can also cause "No matching distribution found"), and if anything still fails it auto-retries package-by-package, skipping only optional packages with no wheel for your system. Re-running `python runner.py` is always safe — it never wipes a working venv. If you previously hit this error, delete the half-built folder `vidyajyoti/backend/.venv` once and re-run.
 - **`db: "error"` in /api/health** → PostgreSQL isn't running or credentials mismatch. Re-check STEP 1 and `DATABASE_URL`.
 - **`ModuleNotFoundError: app` / `app_ml`** → run uvicorn from inside `backend/` or `backend_ml/` respectively (not from the project root).
-- **Port already in use** → find & kill the process (`lsof -i :3000` / `:8000` / `:9000`) or change the port in `package.json` script / uvicorn flags.
+- **Port already in use** → find & kill the process (`lsof -i :3000` / `:8000` / `:9000`, on Windows `netstat -ano | findstr :8000`) or change the port in `package.json` script / uvicorn flags. `runner.py` frees stale ports automatically.
 - **CORS errors in browser console** → backend must allow `http://localhost:3000` (already configured in `backend/app/main.py`).
-- **`pip install` of ML deps is slow/huge** → expected (PyTorch ≈ 2 GB). Skip STEP 4 if you don't need AI features yet.
+- **`pip install` of ML deps is slow/huge** → expected (PyTorch ≈ 2 GB). Skip the ML service with `python runner.py --no-ml` if you don't need AI features yet; `runner.py` also falls back to a minimal core set if heavy packages fail to build.
 - **Windows users** → use `venv\Scripts\activate` instead of `source venv/bin/activate`.
 
 ## API Endpoints

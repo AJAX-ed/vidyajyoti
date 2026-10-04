@@ -649,17 +649,15 @@ def write_marker(requirements_path, marker_path):
         pass
 
 
-def install_requirements(name, workdir, marker_pkg, optional=False):
+def install_requirements(name, workdir, marker_pkg):
     """Create .venv inside workdir (if needed) and pip install requirements.txt.
 
     Robustness features:
       • Never wipes an existing working venv (safe to re-run).
-      • Auto-retries WITHOUT version pins if a package has no wheel
+      • Auto-retries WITHOUT version pins if a pinned package has no wheel
         for this OS / Python version (fixes 'asyncpg==0.30.0 — No matching
         distribution found' on Windows).
       • Only reinstalls when requirements.txt changed or something is missing.
-      • optional=True (ML service): if even core install fails, do NOT abort —
-        print instructions and return None so the runner continues without it.
     """
     head(f"STEP 2 — Installing '{name}' Python dependencies")
     venv_dir = workdir / ".venv"
@@ -742,14 +740,6 @@ def install_requirements(name, workdir, marker_pkg, optional=False):
         kept_names = {pkg_name(s) for s in kept}
         still_missing = [c for c in core_needed if c not in kept_names]
         if still_missing:
-            if optional:
-                warn("Could not fully install ML service dependencies on this "
-                     "machine (" + ", ".join(sorted(still_missing)) + ").")
-                warn("Continuing WITHOUT the ML service — the app is fully "
-                     "usable (backend :8000 + frontend :3000).")
-                warn(f"To install it manually later:  {py} -m pip install -r "
-                     f"{req}")
-                return None
             err("Automatic dependency installation failed for CORE packages: "
                 + ", ".join(sorted(still_missing)))
             err("Please run manually:  " + str(py) + " -m pip install -r "
