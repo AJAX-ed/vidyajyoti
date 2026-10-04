@@ -28,6 +28,14 @@ Useful flags:
 
 Then open **http://localhost:3000**. API docs: http://localhost:8000/docs.
 
+> 🔧 **Fixed wheel-compat issue (asyncpg / Windows):** exact pins like
+> `asyncpg==0.30.0` have no prebuilt wheels for some Windows/Python combos and
+> caused *"No matching distribution found"*. All `requirements.txt` files now use
+> flexible ranges (`asyncpg>=0.29`, etc.), the runner upgrades pip inside every
+> fresh venv before installing, and retries package-by-package as a last resort.
+> If you hit the old error: delete the half-built folder `vidyajyoti/backend/.venv`
+> once, then re-run `python runner.py` — everything else is preserved.
+
 ---
 
 ## Manual Step-by-Step Run
