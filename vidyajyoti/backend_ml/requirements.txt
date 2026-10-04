@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+# All self-hosted, open-source ML — NO external AI APIs.
+numpy>=1.26
+scikit-learn>=1.4
+faiss-cpu>=1.8
+sentence-transformers>=3.0
+torch>=2.2
+transformers>=4.44
