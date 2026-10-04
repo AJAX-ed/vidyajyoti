@@ -52,83 +52,221 @@ interface Answers {
   breakMinutes: number;
 }
 
+/* Peak-productivity windows (minutes since midnight) */
+const PEAK_WINDOWS: Record<Answers["peakProductivity"], [number, number]> = {
+  Morning: [5 * 60, 12 * 60],
+  Afternoon: [12 * 60, 17 * 60],
+  Evening: [17 * 60, 22 * 60],
+  Night: [20 * 60, 23 * 60 + 59],
+};
+
+function overlapsPeak(s: number, e: number, peak: [number, number]): boolean {
+  return s < peak[1] && e > peak[0];
+}
+
 function fillStudySessions(
   slots: Slot[], start: number, end: number,
-  sessionMin: number, breakMin: number, counter: { n: number }
+  sessionMin: number, breakMin: number, counter: { n: number },
+  peak: [number, number]
 ) {
-  let gap = end - start;
+  // Sanitize inputs so the loop can never stall or produce 0-hour plans
+  const sess = Math.min(Math.max(sessionMin || 50, 15), 180);
+  const brk = Math.min(Math.max(breakMin || 10, 5), 30);
+  const gap = end - start;
   if (gap < 20) {
     if (gap >= 5) slots.push({ start, end, type: "break", label: "Short break / free time" });
     return;
   }
   let cur = start;
-  while (end - cur >= sessionMin) {
+  let guard = 0; // hard safety cap — impossible to hang
+  while (end - cur >= sess && guard++ < 100) {
     counter.n += 1;
-    slots.push({ start: cur, end: cur + sessionMin, type: "study", label: `Study session ${counter.n}` });
-    cur += sessionMin;
+    const isPeak = overlapsPeak(cur, cur + sess, peak);
+    slots.push({
+      start: cur, end: cur + sess, type: "study",
+      label: `Study session ${counter.n}${isPeak ? " ⚡ peak focus" : ""}`,
+    });
+    cur += sess;
     // add a break only if a full session still fits after it
-    if (end - cur >= breakMin + sessionMin) {
-      slots.push({ start: cur, end: cur + breakMin, type: "break", label: "Break" });
-      cur += breakMin;
-    } else if (end - cur > 0 && end - cur < sessionMin) {
+    if (end - cur >= brk + sess) {
+      slots.push({ start: cur, end: cur + brk, type: "break", label: "Break" });
+      cur += brk;
+    } else {
       break;
     }
   }
   const leftover = end - cur;
   if (leftover >= 5) slots.push({ start: cur, end, type: "break", label: "Free time" });
-  void gap;
 }
 
 function generateDayPlan(a: Answers): Slot[] {
-  const wake = t2m(a.wakeTime);
-  const sleep = t2m(a.sleepTime) <= wake ? t2m(a.sleepTime) + 1440 : t2m(a.sleepTime);
+  const rawWake = t2m(a.wakeTime);
+  // Wake/sleep sanity: sleep must be later the SAME day; if the user picked an
+  // earlier time (e.g. wake 06:00, sleep 22:30 stored as 05:00), roll it over.
+  let sleepRaw = t2m(a.sleepTime);
+  if (sleepRaw <= rawWake) sleepRaw += 1440; // next-day early morning
+  const DAY_CAP = 1439;
+  // If the rolled-over sleep exceeds midnight, shift BOTH wake and sleep back
+  // by the overflow so the plan fits inside a single 00:00–23:59 canvas while
+  // preserving its exact shape (relative durations).
+  const shift = Math.max(0, sleepRaw - DAY_CAP);
+  const wake = rawWake - shift;
+  const sleep = sleepRaw - shift;
+
   const fixed: Slot[] = [];
 
-  // Sleep before wake (00:00 → wake)
-  fixed.push({ start: 0, end: wake, type: "sleep", label: "Sleep" });
-
-  // Morning routine starting at wake time
+  // Morning routine starting at wake time — capped so it NEVER swallows
+  // school/commute/study time (this was the "breakfast after school" bug).
   let cursor = wake;
   for (const task of a.morningTasks) {
-    fixed.push({ start: cursor, end: cursor + task.minutes, type: "routine", label: task.label });
-    cursor += task.minutes;
+    const dur = Math.max(Number(task.minutes) || 10, 5);
+    const rStart = cursor;
+    const rEnd = Math.min(cursor + dur, sleep);
+    if (rEnd - rStart >= 5) fixed.push({ start: rStart, end: rEnd, type: "routine", label: task.label });
+    cursor = rEnd;
+    if (cursor >= sleep) break;
   }
 
-  // Meals
-  const breakfast = t2m(a.breakfast);
-  if (breakfast >= wake) fixed.push({ start: breakfast, end: breakfast + 20, type: "meal", label: "Breakfast" });
-  const lunch = t2m(a.lunch);
-  fixed.push({ start: lunch, end: lunch + 30, type: "meal", label: "Lunch" });
-  const dinner = t2m(a.dinner);
-  fixed.push({ start: dinner, end: dinner + 30, type: "meal", label: "Dinner" });
+  // Meals — anchored inside the waking day, clamped between wake and sleep.
+  // If a meal collides with the routine chain, push it right after the routine.
+  // Breakfast additionally never lands after school/coaching starts.
+  const relTime = (ts: string) => { let m = t2m(ts); if (m < wake) m += 1440; return m - shift; };
+  const schoolStart =
+    a.educationType === "School" || (a.educationType === "Coaching" && a.coachingSubtype === "Dummy")
+      ? relTime(a.leaveHome)
+      : a.educationType === "Coaching" && a.coachingSubtype === "Residential"
+        ? relTime(a.coachingStart)
+        : sleep; // Home School: no anchor
+  const addMeal = (label: string, rawMin: number, dur: number) => {
+    let m = rawMin;
+    if (m < wake || m >= sleep) m = Math.min(Math.max(m, wake), sleep - dur); // keep within waking day
+    m = Math.max(m, cursor); // never earlier than end of morning routine
+    if (label === "Breakfast") {
+      const latest = schoolStart - dur; // must finish before school/coaching starts
+      if (m > latest) m = Math.max(Math.min(latest, cursor), wake); // slide back, not forward
+    }
+    m = Math.min(m, sleep - dur);
+    m = Math.max(m, wake);
+    fixed.push({ start: m, end: m + dur, type: "meal", label });
+  };
+  addMeal("Breakfast", relTime(a.breakfast), 20);
+  addMeal("Lunch", relTime(a.lunch), 30);
+  addMeal("Dinner", relTime(a.dinner), 30);
 
   // School / dummy school + commute
   if (a.educationType === "School" || (a.educationType === "Coaching" && a.coachingSubtype === "Dummy")) {
-    const leave = t2m(a.leaveHome);
-    const back = t2m(a.backHome);
-    fixed.push({ start: leave - a.commuteMinutes, end: leave, type: "travel", label: "Travel to school/coaching" });
-    fixed.push({ start: leave, end: back, type: "school", label: a.educationType === "School" ? "School" : "Dummy school" });
-    fixed.push({ start: back, end: back + a.commuteMinutes, type: "travel", label: "Travel home" });
+    const leave = relTime(a.leaveHome);
+    const back = Math.max(relTime(a.backHome), leave + 30);
+    const comm = Math.max(Number(a.commuteMinutes) || 0, 0);
+    const travelOut = Math.max(leave - comm, wake);
+    if (leave > travelOut) fixed.push({ start: travelOut, end: leave, type: "travel", label: "Travel to school/coaching" });
+    if (Math.min(back, sleep) > leave) fixed.push({ start: leave, end: Math.min(back, sleep), type: "school", label: a.educationType === "School" ? "School" : "Dummy school" });
+    if (back + comm <= sleep && back > leave) fixed.push({ start: back, end: Math.min(back + comm, sleep), type: "travel", label: "Travel home" });
   }
   // Residential coaching
   if (a.educationType === "Coaching" && a.coachingSubtype === "Residential") {
-    fixed.push({ start: t2m(a.coachingStart), end: t2m(a.coachingEnd), type: "school", label: "Coaching" });
+    const cs = relTime(a.coachingStart);
+    const ce = Math.max(relTime(a.coachingEnd), cs + 30);
+    if (Math.min(ce, sleep) > cs) fixed.push({ start: cs, end: Math.min(ce, sleep), type: "school", label: "Coaching" });
   }
 
-  fixed.sort((x, y) => x.start - y.start);
+  // Drop zero/negative-length artifacts and any block outside the waking day
+  const valid = fixed.filter((b) => b.end > b.start && b.start >= 0 && b.start < sleep);
+  valid.sort((x, y) => x.start - y.start);
+
+  // Resolve overlaps with priority clipping: immovable blocks (school/travel)
+  // win over meals, which win over the morning-routine chain. Each block keeps
+  // only the time slices not already claimed by a higher-priority block.
+  const rank: Record<SlotType, number> = {
+    sleep: 0, school: 1, travel: 2, meal: 3, routine: 4, study: 5, break: 6,
+  };
+  const ordered = [...valid].sort(
+    (x, y) => rank[x.type] - rank[y.type] || x.start - y.start
+  );
+
+  type IV = { s: number; e: number };
+  let claimed: IV[] = []; // sorted, non-overlapping "already taken" intervals
+
+  const claim = (s: number, e: number) => {
+    if (e <= s) return;
+    const out: IV[] = [];
+    for (const c of claimed) {
+      if (c.e <= s || c.s >= e) out.push(c);            // untouched
+      else { if (c.s < s) out.push({ s: c.s, e: s }); } // keep left fragment
+    }
+    out.push({ s, e });
+    out.sort((a, b) => a.s - b.s);
+    const mergedIv: IV[] = [];
+    for (const iv of out) {
+      const last = mergedIv[mergedIv.length - 1];
+      if (last && iv.s <= last.e) last.e = Math.max(last.e, iv.e);
+      else mergedIv.push({ ...iv });
+    }
+    claimed = mergedIv;
+  };
+  const free = (s: number, e: number): boolean =>
+    claimed.every((c) => c.e <= s || c.s >= e);
+
+  const merged: Slot[] = [];
+  for (const b of ordered) {
+    if (free(b.start, b.end)) {
+      merged.push({ ...b });
+      claim(b.start, b.end);
+    } else if (b.type === "meal") {
+      // find the nearest free window of the same length. Breakfast searches
+      // BACKWARD first (it must stay before school); other meals search forward.
+      const dur = b.end - b.start;
+      let placed = false;
+      const limit = b.label === "Breakfast" ? Math.min(sleep, schoolStart) : sleep;
+      const tryAt = (s: number) => {
+        if (s >= wake && s + dur <= limit && free(s, s + dur)) {
+          merged.push({ ...b, start: s, end: s + dur });
+          claim(s, s + dur);
+          placed = true;
+          return true;
+        }
+        return false;
+      };
+      if (b.label === "Breakfast") {
+        for (let s = b.start; !placed && s - dur >= wake; s -= 5) tryAt(s);
+      }
+      for (let s = b.start; !placed && s + dur <= limit; s += 5) tryAt(s);
+      // last resort: drop a meal only when literally nowhere fits
+    } else if (b.type === "routine") {
+      // trim the routine's tail so it ends where the first claimed interval begins
+      const cut = claimed.find((c) => c.s > b.start && c.s < b.end)?.s ?? b.start;
+      if (cut - b.start >= 5) {
+        merged.push({ ...b, end: cut });
+        claim(b.start, cut);
+      }
+    }
+    // school/travel fully overlapping another immovable block: drop silently
+  }
+  merged.sort((x, y) => x.start - y.start);
 
   // Walk from wake → sleep, filling gaps with study sessions
-  const slots: Slot[] = [{ start: 0, end: wake, type: "sleep", label: "Sleep" }];
+  const peak = PEAK_WINDOWS[a.peakProductivity] || PEAK_WINDOWS.Morning;
+  const slots: Slot[] = [];
+  if (wake > 0) slots.push({ start: 0, end: wake, type: "sleep", label: "Sleep" });
   const counter = { n: 0 };
   let cur = wake;
-  for (const block of fixed.slice(1)) {
-    if (block.start > cur) fillStudySessions(slots, cur, block.start, a.studySessionMinutes, a.breakMinutes, counter);
-    if (block.start >= cur) slots.push(block);
+  for (const block of merged) {
+    if (block.start < cur) continue; // fully overlapped — already handled by merge
+    if (block.start > cur) fillStudySessions(slots, cur, block.start, a.studySessionMinutes, a.breakMinutes, counter, peak);
+    slots.push(block);
     cur = Math.max(cur, block.end);
   }
-  if (cur < sleep) fillStudySessions(slots, cur, sleep, a.studySessionMinutes, a.breakMinutes, counter);
-  slots.push({ start: sleep, end: 1439, type: "sleep", label: "Sleep" });
-  return slots.sort((x, y) => x.start - y.start);
+  if (cur < sleep) fillStudySessions(slots, cur, sleep, a.studySessionMinutes, a.breakMinutes, counter, peak);
+  if (sleep < 1439) slots.push({ start: sleep, end: 1439, type: "sleep", label: "Sleep" });
+  // Safety net: clamp into [0, 1439], drop degenerate blocks, clip overlaps
+  const out = slots
+    .map((s) => ({ ...s, start: Math.max(0, s.start), end: Math.min(1439, s.end) }))
+    .filter((s) => s.end > s.start)
+    .sort((x, y) => x.start - y.start);
+  for (let i = 1; i < out.length; i++) {
+    if (out[i].start < out[i - 1].end) out[i].start = out[i - 1].end;
+  }
+  return out.filter((s) => s.end > s.start);
 }
 
 /* ================= Small UI helpers ================= */
@@ -199,6 +337,8 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
 
   const totalStudy = dayPlan.filter((s) => s.type === "study").reduce((n, s) => n + (s.end - s.start), 0);
   const nSessions = dayPlan.filter((s) => s.type === "study").length;
+  const studyH = Math.floor(totalStudy / 60);
+  const studyM = totalStudy % 60;
 
   return (
     <div className="min-h-screen bg-app text-app flex items-center justify-center p-4">
@@ -332,7 +472,7 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
               <Step title="Your day plan ✨" icon={<Coffee size={20} />}>
                 <div className="flex gap-3 mb-4 text-xs">
                   <span className="px-3 py-1 rounded-full bg-surface border border-app">{nSessions} study sessions</span>
-                  <span className="px-3 py-1 rounded-full bg-surface border border-app">{Math.round(totalStudy / 6)} h {totalStudy % 60} m study/day</span>
+                  <span className="px-3 py-1 rounded-full bg-surface border border-app">{studyH}h {studyM}m study/day</span>
                   <span className="px-3 py-1 rounded-full bg-surface border border-app">{dayPlan.length} blocks</span>
                 </div>
                 <div className="max-h-80 overflow-y-auto pr-2 space-y-1">

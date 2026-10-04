@@ -111,7 +111,7 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                   <span className="bg-white/15 rounded-lg px-3 py-1.5">{Math.floor(studyMinutes / 60)}h {studyMinutes % 60}m planned study</span>
                   <span className="bg-white/15 rounded-lg px-3 py-1.5">{plan.filter((s) => s.type === "study").length} sessions today</span>
                   <span className="bg-white/15 rounded-lg px-3 py-1.5">
-                    Now: {currentSlot ? currentSlot.label : "Free time"}
+                    Now: {currentSlot ? currentSlot.label : plan.length === 0 ? "Complete onboarding to see your plan" : "Free time"}
                   </span>
                 </div>
               </div>

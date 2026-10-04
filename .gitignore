@@ -1,20 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
+# Dependencies
+node_modules/
 
-# Environment
-.env
-.env.local
-.env.*.local
-
-# Logs
-*.log
-
-# IDEs and Editors
-.vscode/
-.idea/
-*.swp
-*.swo
+# Build artifacts
+dist/
+build/

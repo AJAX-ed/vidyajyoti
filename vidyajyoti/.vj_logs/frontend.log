@@ -1,9 +1,5 @@
 
-> vidyajyoti-frontend@0.0.1 dev
-> vite --host 0.0.0.0 --port 3000
-
-
-  VITE v6.4.3  ready in 576 ms
+  VITE v6.4.3  ready in 566 ms
 
   ➜  Local:   http://localhost:3000/
-  ➜  Network: http://21.0.12.171:3000/
+  ➜  Network: http://21.0.7.160:3000/
