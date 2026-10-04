@@ -1,0 +1,72 @@
+@import "tailwindcss";
+
+/* ---------- Theme variables ---------- */
+:root,
+html.dark {
+  --bg: #0a0f0d;
+  --surface: #121a16;
+  --surface-hover: #1a2520;
+  --border: #24332c;
+  --text: #e8f0ec;
+  --text-muted: #8fa39a;
+  --primary: #10b981;
+  --accent: #f59e0b;
+}
+
+html.light,
+.light {
+  --bg: #f6f8f7;
+  --surface: #ffffff;
+  --surface-hover: #eef2f0;
+  --border: #d8e0dc;
+  --text: #10201a;
+  --text-muted: #5a6b63;
+  --primary: #059669;
+  --accent: #d97706;
+}
+
+/* ---------- Utility classes ---------- */
+.bg-app { background-color: var(--bg); }
+.bg-surface { background-color: var(--surface); }
+.bg-surface-hover:hover { background-color: var(--surface-hover); }
+.text-app { color: var(--text); }
+.text-muted { color: var(--text-muted); }
+.border-app { border-color: var(--border); }
+
+.gradient-emerald {
+  background-image: linear-gradient(135deg, #10b981 0%, #059669 50%, #047857 100%);
+}
+.text-gradient-emerald {
+  background-image: linear-gradient(135deg, #34d399, #10b981, #f59e0b);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* ---------- Global input/select styles ---------- */
+input,
+select {
+  background-color: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  width: 100%;
+  outline: none;
+}
+
+input:focus,
+select:focus {
+  border-color: var(--primary);
+}
+
+/* ---------- Smooth transitions ---------- */
+* {
+  transition: background-color 0.2s, border-color 0.2s, color 0.2s;
+}
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
