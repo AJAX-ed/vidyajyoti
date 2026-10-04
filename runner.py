@@ -127,27 +127,42 @@ def head(msg):  print(f"\n{B}{'=' * 70}{X}\n{B} {msg}{X}\n{B}{'=' * 70}{X}")
 # STEP 0 — Ensure required PYTHON modules (install on demand, as requested)
 # ----------------------------------------------------------------------------
 def ensure_module(import_name, pip_name=None):
-    """try: import <module>  except: pip install it, then import again."""
+    """try: import <module>  except: pip install it, then import again.
+
+    Retries with --only-binary :all: so source builds (which need things
+    like pg_config / C compilers that a fresh Windows machine doesn't have)
+    are never attempted — pip will grab the prebuilt wheel instead.
+    """
     pip_name = pip_name or import_name
     try:
         __import__(import_name)
         return True
     except ImportError:
-        warn(f"Python module '{import_name}' not found — installing via pip ...")
+        pass
+    warn(f"Python module '{import_name}' not found — installing via pip ...")
+    # attempt 1: normal install
+    ret = subprocess.run(
+        [PYTHON, "-m", "pip", "install", "--quiet", pip_name]
+    ).returncode
+    # attempt 2: wheels only (no source build => no pg_config/compiler needed)
+    if ret != 0:
+        warn(f"Source install of '{pip_name}' failed — retrying with "
+             "--only-binary :all: (prebuilt wheel only) ...")
         ret = subprocess.run(
-            [PYTHON, "-m", "pip", "install", "--quiet", pip_name]
+            [PYTHON, "-m", "pip", "install", "--quiet",
+             "--only-binary", ":all:", pip_name]
         ).returncode
-        if ret != 0:
-            err(f"Could not install '{pip_name}'. Install it manually: "
-                f"{PYTHON} -m pip install {pip_name}")
-            return False
-        try:
-            __import__(import_name)
-            ok(f"Module '{import_name}' installed successfully.")
-            return True
-        except ImportError:
-            err(f"'{pip_name}' installed but import still fails.")
-            return False
+    if ret != 0:
+        err(f"Could not install '{pip_name}'. Install it manually: "
+            f"{PYTHON} -m pip install {pip_name}")
+        return False
+    try:
+        __import__(import_name)
+        ok(f"Module '{import_name}' installed successfully.")
+        return True
+    except ImportError:
+        err(f"'{pip_name}' installed but import still fails.")
+        return False
 
 
 HAS_PSUTIL = False
@@ -697,16 +712,30 @@ def install_requirements(name, workdir, marker_pkg, optional=False):
         info(f"pip installing {rel(req)} into {venv_dir.name} "
              "(be patient — first time may download a lot) ...")
         ret = subprocess.run([str(py), "-m", "pip", "install",
-                              "-r", str(req)]).returncode
+                              "--prefer-binary", "-r", str(req)]).returncode
         if ret == 0:
             ok(f"'{name}' dependencies installed.")
             write_marker(req, marker)
             return py
         warn("requirements.txt install failed (a package likely has no wheel "
-             "for this OS / Python version). Retrying with flexible "
-             "version ranges — this keeps everything compatible...")
+             "for this OS / Python version, or tried to build from source and "
+             "needs tools like pg_config / a C compiler). Retrying with "
+             "prebuilt wheels only — this keeps everything compatible...")
 
-    # --- attempt 2: unpinned / fallback versions ----------------------------
+    # --- attempt 2: wheels-only install (no source builds => no compilers,   )
+    #             no pg_config; pip picks the newest version WITH a wheel     )
+    if req.exists():
+        ret = subprocess.run([str(py), "-m", "pip", "install",
+                              "--only-binary", ":all:",
+                              "-r", str(req)]).returncode
+        if ret == 0:
+            ok(f"'{name}' dependencies installed (wheels only).")
+            write_marker(req, marker)
+            return py
+        warn("Wheel-only install of the full requirements.txt still failed. "
+             "Retrying with flexible version ranges package-by-package ...")
+
+    # --- attempt 3: unpinned / fallback versions ----------------------------
     def pkg_name(spec):
         return re.split(r"[=<>!;\[ ]", spec, maxsplit=1)[0].strip()
 
@@ -726,13 +755,20 @@ def install_requirements(name, workdir, marker_pkg, optional=False):
                  "psycopg2-binary"]
 
     info(f"pip installing ({', '.join(specs[:6])} ...) into {venv_dir.name}")
-    ret = subprocess.run([str(py), "-m", "pip", "install", *specs]).returncode
+    ret = subprocess.run([str(py), "-m", "pip", "install",
+                          "--prefer-binary", *specs]).returncode
     if ret != 0:
         # per-package pass: collect names that genuinely fail on this machine
         failed, kept = [], []
         for s in specs:
-            r = subprocess.run([str(py), "-m", "pip", "install", s],
+            r = subprocess.run([str(py), "-m", "pip", "install",
+                                "--prefer-binary", s],
                                capture_output=True, text=True)
+            if r.returncode != 0:
+                # last resort for this package: prebuilt wheel only
+                r = subprocess.run([str(py), "-m", "pip", "install",
+                                    "--only-binary", ":all:", s],
+                                   capture_output=True, text=True)
             (kept if r.returncode == 0 else failed).append(s)
         if failed:
             warn("Some optional packages have no wheel for this system and "

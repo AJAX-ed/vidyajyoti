@@ -2,13 +2,6 @@
 __pycache__/
 *.pyc
 
-# Virtual Environments
-.venv/
-venv/
-
-# Node Dependencies
-node_modules/
-
 # Logs
 .vj_logs/
 *.log
