@@ -49,10 +49,12 @@ NO EXTERNAL AI APIs are used anywhere — the ML service runs self-hosted models
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -167,11 +169,34 @@ def ensure_module(import_name, pip_name=None):
 
 HAS_PSUTIL = False
 HAS_PSYCOPG2 = False
+_PIP_UPGRADED = False
+
+
+def ensure_pip_current():
+    """Make sure the interpreter's pip can see brand-new wheels.
+
+    Fresh Python releases (e.g. 3.14 on Windows) often ship an old bundled
+    pip that reports "No matching distribution found" for perfectly valid
+    packages simply because it can't parse the latest wheel metadata or the
+    package didn't exist yet when that pip was released. Upgrading pip once
+    per runner session fixes asyncpg/psycopg2-binary install failures.
+    """
+    global _PIP_UPGRADED
+    if _PIP_UPGRADED:
+        return
+    _PIP_UPGRADED = True
+    ret = subprocess.run([PYTHON, "-m", "pip", "install", "--quiet",
+                          "--upgrade", "pip"]).returncode
+    if ret == 0:
+        ok("pip is up to date (needed for newest wheels on this Python).")
+    else:
+        warn("Could not upgrade pip — continuing with the bundled version.")
 
 
 def check_python_modules(with_db=True):
     global HAS_PSUTIL, HAS_PSYCOPG2
     head("STEP 0 — Checking required Python modules")
+    ensure_pip_current()
     HAS_PSUTIL = ensure_module("psutil")
     if with_db:
         HAS_PSYCOPG2 = ensure_module("psycopg2", "psycopg2-binary")
@@ -180,8 +205,94 @@ def check_python_modules(with_db=True):
 # ----------------------------------------------------------------------------
 # OS detection & privileged command execution (for auto-installing Node/PG)
 # ----------------------------------------------------------------------------
+def refresh_path_cache():
+    """Re-read PATH from the Windows registry after an installer changed it."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import winreg
+        for hive, key in ((winreg.HKEY_LOCAL_MACHINE,
+                           r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                          (winreg.HKEY_CURRENT_USER, "Environment")):
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    val, _ = winreg.QueryValueEx(k, "Path")
+                os.environ["PATH"] = val + os.pathsep + \
+                    os.environ.get("PATH", "")
+            except OSError:
+                continue
+        # also make sure standard Node install dir is present
+        for cand in (r"C:\Program Files\nodejs",):
+            if Path(cand).is_dir() and cand not in os.environ.get("PATH", ""):
+                add_to_path_front(cand)
+    except Exception:
+        pass
+
+
+def run_as_admin(cmd):
+    """Run a command elevated on Windows (UAC prompt), or normally elsewhere.
+
+    Returns the process exit code, or 1 on failure to launch.
+    """
+    if isinstance(cmd, str):
+        cmdline = cmd
+    else:
+        cmdline = subprocess.list2cmdline([str(c) for c in cmd])
+    if not IS_WINDOWS:
+        prefix = sudo_prefix() or []
+        try:
+            return subprocess.run(list(prefix) +
+                                  (cmd if isinstance(cmd, list) else [cmd])).returncode
+        except Exception:
+            return 1
+    try:
+        shell_cmd = f'setlocal & powershell -NoProfile -Command "{cmdline}"'
+        ret = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f'$p = Start-Process -FilePath "cmd.exe" '
+             f'-ArgumentList "/c {cmdline} ^& exit $LASTEXITCODE" '
+             f"-Verb RunAs -Wait -PassThru; exit $p.ExitCode"],
+            capture_output=True, text=True).returncode
+        return ret
+    except Exception:
+        return 1
+
+
+def find_pg_services_windows():
+    """Return names of installed-but-stopped PostgreSQL Windows services."""
+    svcs = []
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Service | Where-Object {$_.Name -like 'postgres*'} | "
+             "Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True).stdout
+        svcs = [s.strip() for s in out.splitlines() if s.strip()]
+    except Exception:
+        pass
+    return svcs
+
+
+def wait_for_pg_service_ready(timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pg_is_running():
+            return True
+        time.sleep(2)
+    return False
+
+
+# NOTE: IS_WINDOWS is defined HERE, before every function that uses it.
+# It used to be defined further down the file; on Windows that made
+# ensure_postgres() raise NameError('IS_WINDOWS'), which was swallowed and
+# mis-reported as "Could not install PostgreSQL via apt/brew". Fixed.
+IS_WINDOWS = (os.name == "nt")
+
+
 def detect_os():
-    """Return 'debian', 'macos', or 'other'."""
+    """Return 'windows', 'debian', 'macos', or 'other'."""
+    if IS_WINDOWS:
+        return "windows"
     if sys.platform == "darwin":
         return "macos"
     try:
@@ -195,8 +306,160 @@ def detect_os():
     return "other"
 
 
+def pg_env_password():
+    """Superuser password entered by the user during the Windows installer."""
+    return os.environ.get("PGPASS") or ""
+
+
+def winget_install(pkg_id):
+    """Install via winget with agreements auto-accepted. Returns True on success."""
+    exe = shutil.which("winget")
+    if not exe:
+        return False
+    ret = subprocess.run([exe, "install", "-e", "--id", pkg_id, "--accept-source-agreements",
+                          "--accept-package-agreements"]).returncode
+    return ret == 0
+
+
+def choco_install(pkg_id):
+    exe = shutil.which("choco")
+    if not exe:
+        return False
+    return subprocess.run([exe, "install", "-y", pkg_id]).returncode == 0
+
+
+def download_file(url, dest, quiet=False):
+    import urllib.request
+
+    class _UA(urllib.request.Request):
+        def add_header(self, key, val):   # urllib blocks User-Agent otherwise
+            super().add_header(key.replace("-", "_"), val)
+
+    req = _UA(url)
+    req.add_header("User-Agent", "VidyaJyoti-runner/1.0")
+    with urllib.request.urlopen(req, timeout=300) as r, open(dest, "wb") as fh:
+        shutil.copyfileobj(r, fh)
+    return dest
+
+
+def install_node_windows():
+    """Windows Node.js install: try winget / choco, then official .msi."""
+    info("Installing Node.js LTS on Windows ...")
+    if winget_install("OpenJS.NodeJS.LTS"):
+        refresh_path_cache()
+        if shutil.which("node"):
+            ok("Node.js installed via winget.")
+            return True
+    if choco_install("nodejs-lts"):
+        refresh_path_cache()
+        if shutil.which("node"):
+            ok("Node.js installed via Chocolatey.")
+            return True
+    info("Package managers unavailable/failed — downloading the official "
+         "Node.js LTS .msi installer ...")
+    try:
+        import urllib.request
+        index = json.loads(urllib.request.urlopen(
+            "https://nodejs.org/dist/index.json", timeout=30).read())
+        latest_lts = next(v for v in index if v.get("lts"))
+        ver = latest_lts["version"]                      # e.g. 'v22.14.0'
+        arch = "x64" if platform.machine() in ("AMD64", "x86_64") else "arm64"
+        fname = f"node-{ver}-win-{arch}.msi"
+        url = f"https://nodejs.org/dist/{ver}/{fname}"
+        tmp = Path(tempfile.gettempdir()) / fname
+        download_file(url, tmp)
+        info(f"Running installer for {fname} — please complete the Node.js "
+             "setup wizard (keep 'Add to PATH' checked) ...")
+        subprocess.run(["msiexec", "/i", str(tmp)])
+        tmp.unlink(missing_ok=True)
+        refresh_path_cache()
+        if shutil.which("node"):
+            ok("Node.js installed via official MSI.")
+            return True
+        err("MSI ran but node is still not on PATH. Open a NEW terminal "
+            "(or reboot) and re-run: python runner.py")
+        return False
+    except Exception as e:
+        err(f"Windows Node.js install failed: {e}")
+        print(f"   {Y}Manual option: install Node LTS from https://nodejs.org "
+              f"and re-run python runner.py{X}")
+        return False
+
+
+def install_postgres_windows(auto_install=True):
+    """Make PostgreSQL reachable on Windows.
+
+    Strategy (in order):
+      1. Start an already-installed Windows service (postgresql-x64-*).
+      2. winget / Chocolatey install of PostgreSQL 16 (silent, unattended —
+         superuser password becomes 'postgres').
+      3. Download & run the EnterpriseDB interactive installer (the runner
+         remembers the password you enter via env var PGPASS for STEP 3).
+      4. Docker fallback (if docker + WSL2 are present).
+    """
+    # 1) existing-but-stopped service?
+    for svc in find_pg_services_windows():
+        info(f"Trying to start Windows service '{svc}' ...")
+        if run_as_admin(["sc", "start", svc]) == 0:
+            for _ in range(20):
+                if pg_is_running():
+                    ok(f"PostgreSQL service '{svc}' started.")
+                    return True
+            warn(f"Service '{svc}' did not come up within 20s.")
+    if not auto_install:
+        return False
+
+    # 2) winget / choco (fully silent)
+    pw = "postgres"
+    if winget_install("PostgreSQL.PostgreSQL.16"):
+        refresh_path_cache()
+        if wait_for_pg_service_ready():
+            ok("PostgreSQL 16 installed via winget.")
+            os.environ["PGPASS"] = pw
+            return True
+    if choco_install("postgresql"):
+        refresh_path_cache()
+        if wait_for_pg_service_ready():
+            ok("PostgreSQL installed via Chocolatey.")
+            os.environ["PGPASS"] = pw
+            return True
+
+    # 3) EnterpriseDB installer (interactive GUI)
+    info("No package manager succeeded — downloading the official "
+         "PostgreSQL 16 installer (EnterpriseDB) ...")
+    try:
+        edb_base = ("https://get.enterprisedb.com/postgresql/"
+                    "postgresql-16.4-2-windows-x64.exe")
+        tmp = Path(tempfile.gettempdir()) / "vj-postgresql-setup.exe"
+        download_file(edb_base, tmp)
+        print(f"{Y}An installer wizard will open. IMPORTANT:{X}\n"
+              f"  • Database superuser password: enter  {B}postgres{X}\n"
+              f"    (this runner will use it automatically; keep defaults "
+              f"for everything else)\n"
+              f"  • When it finishes, this script continues on its own.")
+        os.environ["PGPASS"] = pw
+        subprocess.run([str(tmp), "--mode", "wizard"])
+        tmp.unlink(missing_ok=True)
+        refresh_path_cache()
+        if wait_for_pg_service_ready():
+            ok("PostgreSQL installed via EnterpriseDB installer.")
+            return True
+    except Exception as e:
+        warn(f"EnterpriseDB installer step failed: {e}")
+
+    # 4) docker fallback
+    if start_pg_docker():
+        return True
+    err("Automatic PostgreSQL installation failed on Windows.")
+    print(f"   {Y}Install it manually (see README.md STEP 1 — Windows section)"
+          f" and re-run python runner.py{X}")
+    return False
+
+
 def sudo_prefix():
     """'' when running as root, else ['sudo'] (sudo is verified/installed)."""
+    if IS_WINDOWS:
+        return []          # elevation handled by run_as_admin instead
     if os.geteuid() == 0 if hasattr(os, "geteuid") else False:
         return []
     if shutil.which("sudo"):
@@ -281,13 +544,17 @@ def install_node_tarball():
 
 def ensure_node(auto_install=True):
     """Guarantee node+npm on PATH; install Node LTS if missing."""
-    if shutil.which("node") and shutil.which("npm"):
+    if IS_WINDOWS:
+        refresh_path_cache()          # picks up installs from other terminals
+    if shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")):
         return True
     if not auto_install:
         err("Node.js/npm not found and --no-install was given.")
         return False
     warn("Node.js / npm NOT found — auto-installing now (this may take a few minutes) ...")
     ostype = detect_os()
+    if ostype == "windows":
+        return install_node_windows()
     brew = shutil.which("brew")
     if ostype == "debian":
         if run_privileged(["apt-get", "update"]) == 0 and \
@@ -499,6 +766,8 @@ def ensure_postgres(auto_install=True):
     if pg_is_running():
         ok(f"PostgreSQL already reachable at localhost:{DB_PORT}.")
         return True
+    if IS_WINDOWS:
+        return install_postgres_windows(auto_install=auto_install)
     if not auto_install:
         warn("PostgreSQL not reachable and --no-install was given; "
              "DB-backed endpoints will fail.")
@@ -522,7 +791,18 @@ def ensure_postgres(auto_install=True):
     elif find_pg_binary("initdb"):
         info("PostgreSQL binaries already present but server stopped.")
     else:
-        warn("Could not install PostgreSQL via apt/brew — trying Docker ...")
+        # Show the REAL reason (missing package manager / no root / etc.)
+        # instead of the old blanket "apt/brew" message that hid errors.
+        reasons = []
+        if ostype == "debian":
+            reasons.append("apt-get update/install failed "
+                           "(no internet or no sudo rights?)")
+        elif ostype == "macos":
+            reasons.append("Homebrew not found or 'brew install postgresql@16' failed")
+        else:
+            reasons.append(f"no supported package manager for OS '{ostype}'")
+        warn("Could not install PostgreSQL via system package manager: "
+             + "; ".join(reasons) + " — trying Docker ...")
         if start_pg_docker():
             return True
         err("Automatic PostgreSQL installation failed.")
@@ -613,8 +893,8 @@ def check_node_and_frontend(auto_install=True):
 
     if not (FRONTEND_DIR / "node_modules").exists():
         info("node_modules missing — running 'npm install' (this can take a while) ...")
-        ret = subprocess.run(["npm", "install", "--no-audit", "--no-fund"],
-                             cwd=FRONTEND_DIR).returncode
+        ret = subprocess.run([npm_cmd(), "install", "--no-audit", "--no-fund"],
+                             cwd=FRONTEND_DIR, shell=IS_WINDOWS).returncode
         if ret != 0:
             err("npm install failed. Fix the errors above and re-run runner.py")
             sys.exit(1)
@@ -689,10 +969,32 @@ def install_requirements(name, workdir, marker_pkg, optional=False):
     req = workdir / "requirements.txt"
     marker = venv_dir / ".vj_req_hash"
 
+    # Stale-venv guard: if .venv was created by a DIFFERENT (older) Python
+    # than the one running the runner now, its pip cache can be too old to see
+    # new wheels — nuke and recreate so everything lands on the current Python.
+    ver_marker = venv_dir / ".vj_pyver"
+    want_ver = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    try:
+        prev_ver = ver_marker.read_text().strip()
+    except Exception:
+        prev_ver = ""
+    if py.exists() and prev_ver and prev_ver != want_ver:
+        warn(f"Existing .venv was built with Python {prev_ver}, but you are now "
+             f"running Python {want_ver} — recreating the virtual environment ...")
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        ret = subprocess.run([PYTHON, "-m", "venv", str(venv_dir)]).returncode
+        if ret != 0:
+            err("Failed to recreate venv.")
+            sys.exit(1)
+
     # Fresh venvs ship with an old bundled pip that may not know about the
     # newest wheels ("No matching distribution found"). Always upgrade first.
     subprocess.run([str(py), "-m", "pip", "install", "--upgrade",
                     "pip", "setuptools", "wheel", "--quiet"])
+    try:
+        ver_marker.write_text(want_ver)
+    except Exception:
+        pass
 
     def req_changed():
         try:
@@ -721,6 +1023,10 @@ def install_requirements(name, workdir, marker_pkg, optional=False):
              "for this OS / Python version, or tried to build from source and "
              "needs tools like pg_config / a C compiler). Retrying with "
              "prebuilt wheels only — this keeps everything compatible...")
+        if IS_WINDOWS and sys.version_info >= (3, 13):
+            info("HINT: on Windows + Python 3.13/3.14 some packages have no "
+                 "wheels yet. If retries below also fail, install Python 3.12 "
+                 "(python.org) and run:  py -3.12 runner.py")
 
     # --- attempt 2: wheels-only install (no source builds => no compilers,   )
     #             no pg_config; pip picks the newest version WITH a wheel     )
@@ -811,7 +1117,9 @@ def bootstrap_postgres(auto_install=True):
                • Ubuntu/Debian   :  sudo service postgresql start
                • Docker          :  docker run -d --name vj-pg \
 -P 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
-               • Windows         :  start the "postgresql-x64-16" service
+               • Windows         :  press Win+R → services.msc → start
+                 "postgresql-x64-16"  (or re-run this script WITHOUT --no-install
+                 so it auto-installs PostgreSQL for you)
              Then re-run: python runner.py{X}
         '''))
         return False
@@ -833,7 +1141,15 @@ def bootstrap_postgres(auto_install=True):
     admin_conn = None
     tried = []
     candidates = [("postgres", ""), ("postgres", "postgres"),
-                  (os.getenv("USER", "postgres"), "")]
+                  ("postgres", pg_env_password())]
+    if IS_WINDOWS:
+        # EnterpriseDB installer sets this env var while its wizard runs;
+        # it usually holds the superuser password you typed.
+        candidates.append(("postgres", os.environ.get("PGPASSWORD", "")))
+    candidates.append((os.getenv("USER", "postgres"), ""))
+    seen = set()
+    candidates = [c for c in candidates
+                  if not (c in seen or seen.add(c))]
     for u, p in candidates:
         try:
             admin_conn = connect("postgres", u, p)
@@ -968,6 +1284,45 @@ def wait_for_port(port, timeout=60):
     return False
 
 
+def npm_cmd():
+    """Resolve the npm executable on Windows ('npm' alone is a .cmd shim)."""
+    if IS_WINDOWS:
+        found = (shutil.which("npm.cmd") or shutil.which("npm.exe")
+                 or shutil.which("npm"))
+        if not found:
+            for cand in (Path(r"C:\Program Files\nodejs\npm.cmd"),
+                         Path(os.environ.get("APPDATA", "")) / "npm.cmd"):
+                if cand.exists():
+                    found = str(cand)
+                    break
+        return found or "npm"
+    return "npm"
+
+
+def resolve_npm():
+    """Return (exe, is_shim) for npm on this machine.
+
+    On Windows 'npm' is really npm.cmd — a batch shim that CreateProcess
+    cannot launch directly (FileNotFoundError / WinError 2). We detect the
+    real path so we can quote it and/or run it through cmd.exe.
+    """
+    if not IS_WINDOWS:
+        return "npm", False
+    found = (shutil.which("npm.cmd") or shutil.which("npm.exe")
+             or shutil.which("npm"))
+    if not found:
+        for cand in (Path(r"C:\Program Files\nodejs\npm.cmd"),
+                     Path(os.environ.get("APPDATA", "")) / "npm.cmd"):
+            if cand.exists():
+                found = str(cand)
+                break
+    if not found:
+        return "npm", True
+    is_shim = found.lower().endswith((".cmd", ".bat")) or \
+        not found.lower().endswith(".exe")
+    return found, is_shim
+
+
 def start_service(name, cmd, cwd, port, env=None):
     head(f"STEP 4 — Starting {name}")
     LOG_DIR.mkdir(exist_ok=True)
@@ -976,11 +1331,35 @@ def start_service(name, cmd, cwd, port, env=None):
     run_env = dict(os.environ)
     if env:
         run_env.update(env)
+    # Make sure freshly-installed Node/PG dirs are visible to children.
+    if IS_WINDOWS:
+        refresh_path_cache()
+        for extra in (r"C:\Program Files\nodejs",):
+            if Path(extra).is_dir() and extra not in run_env.get("PATH", ""):
+                run_env["PATH"] = extra + os.pathsep + run_env.get("PATH", "")
     info(f"Command : {' '.join(str(c) for c in cmd)}")
     info(f"Workdir : {rel(cwd)}")
     info(f"Logfile : {rel(logfile)}")
-    proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=fh,
-                            stderr=subprocess.STDOUT, env=run_env)
+    popen_kw = {}
+    final_cmd = cmd
+    # On Windows, batch-file launchers like npm.cmd cannot be started by
+    # CreateProcess directly (WinError 2). Run them through cmd.exe with the
+    # shim path quoted — quoting matters because user folders often contain
+    # spaces (e.g. "C:\Users\Jane Doe\...").
+    if IS_WINDOWS and isinstance(cmd, list) and \
+            str(cmd[0]).lower().replace("\\", "/")\
+               .split("/")[-1].split(".")[0] in ("npm", "npx", "yarn", "pnpm"):
+        exe, _ = resolve_npm()
+        final_cmd = ["cmd.exe", "/c", subprocess.list2cmdline([exe] + [str(c) for c in cmd[1:]])]
+    try:
+        proc = subprocess.Popen(final_cmd, cwd=str(cwd), stdout=fh,
+                                stderr=subprocess.STDOUT, env=run_env, **popen_kw)
+    except FileNotFoundError as e:
+        fh.close()
+        err(f"Could not start {name}: {e}")
+        print(f"   {Y}The launcher executable was not found on PATH. "
+              f"Re-run 'python runner.py' (it will re-check installations).{X}")
+        return None
     PROCESSES[name] = (proc, port, logfile)
     if wait_for_port(port, timeout=90):
         ok(f"{name} is UP on port {port}  →  http://localhost:{port}")
@@ -990,19 +1369,30 @@ def start_service(name, cmd, cwd, port, env=None):
             print("\n".join(logfile.read_text().splitlines()[-15:]))
         except Exception:
             pass
+    return proc
 
 
 def start_backend(py_bin):
-    # Create tables (idempotent) before serving requests.
-    info("Ensuring database tables exist (Base.metadata.create_all) ...")
-    ret = subprocess.run(
-        [str(py_bin), "-c",
-         "import asyncio, app.models, app.database as d;"
-         "asyncio.run(d.init_db()); print('tables ready')"],
-        cwd=str(BACKEND_DIR)).returncode
-    if ret != 0:
-        warn("Could not pre-create tables — backend will still start; "
-             "DB endpoints may fail until the schema exists.")
+    # Create tables (idempotent) before serving requests.  Only attempt this
+    # when PostgreSQL is actually reachable — otherwise we'd just print a
+    # giant asyncpg ConnectionRefused traceback for no reason.
+    if pg_is_running():
+        info("Ensuring database tables exist (Base.metadata.create_all) ...")
+        ret = subprocess.run(
+            [str(py_bin), "-c",
+             "import asyncio, app.models, app.database as d;"
+             "asyncio.run(d.init_db()); print('tables ready')"],
+            cwd=str(BACKEND_DIR),
+            capture_output=True, text=True).returncode
+        if ret == 0:
+            ok("Database tables are ready.")
+        else:
+            warn("Could not pre-create tables — backend will still start; "
+                 "DB endpoints may fail until the schema exists.")
+    else:
+        warn("PostgreSQL is not reachable — skipping table creation. "
+             "DB-backed endpoints will fail until you start the database "
+             "(see README.md STEP 1), then re-run python runner.py.")
     start_service(
         "backend",
         [str(py_bin), "-m", "uvicorn", "app.main:app",
@@ -1012,9 +1402,63 @@ def start_backend(py_bin):
 
 
 def start_frontend():
-    start_service(
+    """Launch 'npm run dev' on Windows in a CreateProcess-safe way.
+
+    On Windows, 'npm' is really npm.cmd — a batch shim that Python's
+    CreateProcess cannot launch directly (FileNotFoundError / WinError 2),
+    and user folders often contain spaces ("OneDrive\\Desktop"), so quoting
+    matters. Strategy:
+      1. resolve the real npm.cmd path,
+      2. build one fully-quoted cmd.exe command line,
+      3. if even that fails to spawn, fall back to running Vite directly
+         with Node (node node_modules/vite/bin/vite.js) — no npm needed.
+    """
+    if IS_WINDOWS:
+        refresh_path_cache()
+        exe, _ = resolve_npm()
+        quoted = subprocess.list2cmdline([exe, "run", "dev"])
+        cmd_line = f'@echo off & chcp 65001 >nul & cd /d "{FRONTEND_DIR}" & {quoted}'
+        LOG_DIR.mkdir(exist_ok=True)
+        logfile = LOG_DIR / "frontend.log"
+        head("STEP 4 — Starting frontend")
+        info(f"Command : {quoted}")
+        info(f"Workdir : {rel(FRONTEND_DIR)}")
+        info(f"Logfile : {rel(logfile)}")
+        try:
+            with open(logfile, "w") as fh:
+                proc = subprocess.Popen(
+                    ["cmd.exe", "/c", cmd_line],
+                    cwd=str(FRONTEND_DIR), stdout=fh,
+                    stderr=subprocess.STDOUT)
+            PROCESSES["frontend"] = (proc, FRONTEND_PORT, logfile)
+            if wait_for_port(FRONTEND_PORT, timeout=90):
+                ok(f"frontend is UP on port {FRONTEND_PORT}  →  "
+                   f"http://localhost:{FRONTEND_PORT}")
+                return proc
+            err("frontend did NOT come up via npm.cmd. Last log lines:")
+            try:
+                print("\n".join(logfile.read_text().splitlines()[-15:]))
+            except Exception:
+                pass
+            warn("Falling back to running Vite directly with Node ...")
+        except OSError as e:
+            err(f"Could not spawn npm via cmd.exe ({e}).")
+            warn("Falling back to running Vite directly with Node ...")
+        # ---- fallback: node + vite.js (bypasses npm entirely) --------------
+        node = shutil.which("node") or r"C:\Program Files\nodejs\node.exe"
+        vite_js = FRONTEND_DIR / "node_modules" / "vite" / "bin" / "vite.js"
+        if Path(node).exists() and vite_js.exists():
+            return start_service(
+                "frontend",
+                [str(node), str(vite_js), "--host", "0.0.0.0",
+                 "--port", str(FRONTEND_PORT)],
+                FRONTEND_DIR, FRONTEND_PORT)
+        err("Frontend could not be started. Ensure Node.js is installed "
+            "(python runner.py can install it automatically without --no-install).")
+        return None
+    return start_service(
         "frontend",
-        ["npm", "run", "dev"],
+        [npm_cmd(), "run", "dev"],
         FRONTEND_DIR, FRONTEND_PORT,
     )
 
@@ -1106,6 +1550,25 @@ def main():
     print(f"\n{B}{C}🪔  VIDYAJYOTI — ONE-CLICK RUNNER{X}{B}"
           f"  (no external AI APIs — fully self-hosted){X}\n")
 
+    # Windows + brand-new Python (e.g. 3.14): some packages such as asyncpg
+    # ship NO wheels yet and psycopg2-binary needs pg_config to build from
+    # source. Warn early and prefer a supported interpreter if we can find one.
+    if IS_WINDOWS and sys.version_info >= (3, 13):
+        warn(f"Detected Python {sys.version.split()[0]} on Windows. Some packages "
+             "(asyncpg / psycopg2-binary) may not have prebuilt wheels for it yet.")
+        for cand in ("py -3.12", "py -3.11", "python3.12", "python3.11"):
+            probe = cand.split()
+            try:
+                r = subprocess.run([probe[0], *(probe[1:]), "-c", "print('ok')"],
+                                   capture_output=True, text=True, timeout=15)
+            except Exception:
+                continue
+            if r.returncode == 0 and "ok" in r.stdout:
+                print(f"   {Y}Tip: re-run with that interpreter for the smoothest "
+                      f"install, e.g.:{X}")
+                print(f"   {B}{cand} runner.py{X}")
+                break
+
     # STEP 0
     check_python_modules(with_db=not args.frontend_only)
 
@@ -1116,7 +1579,7 @@ def main():
     backend_py = install_requirements("backend", BACKEND_DIR, "fastapi")
     ml_py = None
     if not args.no_ml and not args.backend_only and not args.frontend_only:
-        ml_py = install_requirements("ml_service", ML_DIR, "fastapi")
+        ml_py = install_requirements("ml_service", ML_DIR, "fastapi", optional=True)
 
     # STEP 3 — PostgreSQL (auto-installs + starts it if missing!) then bootstrap
     if not args.frontend_only and not args.ml_only:
