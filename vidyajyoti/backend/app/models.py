@@ -111,7 +111,7 @@ class PointsTransaction(Base):
     type = Column(String(50), nullable=False)  # quiz_complete, streak_bonus, doubt_asked, etc.
     delta_points = Column(Integer, default=0)
     delta_coins = Column(Integer, default=0)
-    metadata = Column(JSON, nullable=True)  # Additional context about the transaction
+    meta_info = Column("metadata", JSON, nullable=True)  # Additional context about the transaction (column still named "metadata"; Python attr renamed because 'metadata' is reserved by SQLAlchemy's Declarative API)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships

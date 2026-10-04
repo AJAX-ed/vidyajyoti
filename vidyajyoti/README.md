@@ -110,6 +110,12 @@ The system automatically generates a personalized daily schedule:
 
 ## 🏃 How to Run — Step by Step
 
+> ⚡ **Shortcut:** you don't have to do any of this manually. The repo root contains
+> `runner.py` — run `python runner.py` (from the folder that contains `vidyajyoti/`) and it will
+> install all dependencies, bootstrap PostgreSQL, start backend :8000 + frontend :3000 + ML :9000,
+> and show a status dashboard (Ctrl+C stops everything). Flags: `--setup`, `--no-ml`,
+> `--backend-only`, `--frontend-only`, `--ml-only`. The steps below are for manual control.
+
 Follow these steps **in order**. You need three services running (PostgreSQL is required; the ML service is optional):
 
 | # | Service | Port | Required? |
