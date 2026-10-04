@@ -1,598 +1,413 @@
-import { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { Sun, Moon, Home, School, Utensils, BookOpen, Clock, CheckCircle, ArrowRight, Plus } from 'lucide-react';
+import { useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { toast } from "sonner";
+import {
+  BookOpen, Sunrise, Moon, Sun, Utensils, Brain, CalendarDays, ChevronLeft, ChevronRight,
+  School, Coffee, Bus, Dumbbell, Shower, Sparkles,
+} from "lucide-react";
 
-interface OnboardingQuizProps {
-  onComplete: () => void;
-}
-
-interface DayPlanSlot {
-  start: number;
+/* ================= Types ================= */
+export type SlotType = "study" | "meal" | "school" | "routine" | "break" | "sleep" | "travel";
+export interface Slot {
+  start: number; // minutes since 00:00
   end: number;
-  type: 'study' | 'meal' | 'school' | 'routine' | 'break' | 'sleep' | 'travel';
+  type: SlotType;
   label: string;
 }
 
-// Time conversion helpers
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+
+/* ================= Time helpers ================= */
 function t2m(timeString: string): number {
-  const [hours, minutes] = timeString.split(':').map(Number);
-  return hours * 60 + minutes;
+  const [h, m] = timeString.split(":").map(Number);
+  return h * 60 + m;
 }
-
 function m2t(minutes: number): string {
-  const h = Math.floor(minutes / 60) % 24;
-  const m = minutes % 60;
-  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+  const mm = ((minutes % 1440) + 1440) % 1440;
+  const h = Math.floor(mm / 60);
+  const m = mm % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-export default function OnboardingQuiz({ onComplete }: OnboardingQuizProps) {
+/* ================= Rule-based day plan generator ================= */
+interface Answers {
+  educationType: "School" | "Home School" | "Coaching";
+  coachingSubtype: "Dummy" | "Residential";
+  grade: string;
+  exams: string[];
+  morningTasks: { label: string; minutes: number }[];
+  wakeTime: string;
+  sleepTime: string;
+  leaveHome: string;   // when school/coaching starts (after commute)
+  backHome: string;    // when back home
+  commuteMinutes: number;
+  coachingStart: string;
+  coachingEnd: string;
+  breakfast: string;
+  lunch: string;
+  dinner: string;
+  mealsPerDay: number;
+  peakProductivity: "Morning" | "Afternoon" | "Evening" | "Night";
+  studySessionMinutes: number;
+  breakMinutes: number;
+}
+
+function fillStudySessions(
+  slots: Slot[], start: number, end: number,
+  sessionMin: number, breakMin: number, counter: { n: number }
+) {
+  let gap = end - start;
+  if (gap < 20) {
+    if (gap >= 5) slots.push({ start, end, type: "break", label: "Short break / free time" });
+    return;
+  }
+  let cur = start;
+  while (end - cur >= sessionMin) {
+    counter.n += 1;
+    slots.push({ start: cur, end: cur + sessionMin, type: "study", label: `Study session ${counter.n}` });
+    cur += sessionMin;
+    // add a break only if a full session still fits after it
+    if (end - cur >= breakMin + sessionMin) {
+      slots.push({ start: cur, end: cur + breakMin, type: "break", label: "Break" });
+      cur += breakMin;
+    } else if (end - cur > 0 && end - cur < sessionMin) {
+      break;
+    }
+  }
+  const leftover = end - cur;
+  if (leftover >= 5) slots.push({ start: cur, end, type: "break", label: "Free time" });
+  void gap;
+}
+
+function generateDayPlan(a: Answers): Slot[] {
+  const wake = t2m(a.wakeTime);
+  const sleep = t2m(a.sleepTime) <= wake ? t2m(a.sleepTime) + 1440 : t2m(a.sleepTime);
+  const fixed: Slot[] = [];
+
+  // Sleep before wake (00:00 → wake)
+  fixed.push({ start: 0, end: wake, type: "sleep", label: "Sleep" });
+
+  // Morning routine starting at wake time
+  let cursor = wake;
+  for (const task of a.morningTasks) {
+    fixed.push({ start: cursor, end: cursor + task.minutes, type: "routine", label: task.label });
+    cursor += task.minutes;
+  }
+
+  // Meals
+  const breakfast = t2m(a.breakfast);
+  if (breakfast >= wake) fixed.push({ start: breakfast, end: breakfast + 20, type: "meal", label: "Breakfast" });
+  const lunch = t2m(a.lunch);
+  fixed.push({ start: lunch, end: lunch + 30, type: "meal", label: "Lunch" });
+  const dinner = t2m(a.dinner);
+  fixed.push({ start: dinner, end: dinner + 30, type: "meal", label: "Dinner" });
+
+  // School / dummy school + commute
+  if (a.educationType === "School" || (a.educationType === "Coaching" && a.coachingSubtype === "Dummy")) {
+    const leave = t2m(a.leaveHome);
+    const back = t2m(a.backHome);
+    fixed.push({ start: leave - a.commuteMinutes, end: leave, type: "travel", label: "Travel to school/coaching" });
+    fixed.push({ start: leave, end: back, type: "school", label: a.educationType === "School" ? "School" : "Dummy school" });
+    fixed.push({ start: back, end: back + a.commuteMinutes, type: "travel", label: "Travel home" });
+  }
+  // Residential coaching
+  if (a.educationType === "Coaching" && a.coachingSubtype === "Residential") {
+    fixed.push({ start: t2m(a.coachingStart), end: t2m(a.coachingEnd), type: "school", label: "Coaching" });
+  }
+
+  fixed.sort((x, y) => x.start - y.start);
+
+  // Walk from wake → sleep, filling gaps with study sessions
+  const slots: Slot[] = [{ start: 0, end: wake, type: "sleep", label: "Sleep" }];
+  const counter = { n: 0 };
+  let cur = wake;
+  for (const block of fixed.slice(1)) {
+    if (block.start > cur) fillStudySessions(slots, cur, block.start, a.studySessionMinutes, a.breakMinutes, counter);
+    if (block.start >= cur) slots.push(block);
+    cur = Math.max(cur, block.end);
+  }
+  if (cur < sleep) fillStudySessions(slots, cur, sleep, a.studySessionMinutes, a.breakMinutes, counter);
+  slots.push({ start: sleep, end: 1439, type: "sleep", label: "Sleep" });
+  return slots.sort((x, y) => x.start - y.start);
+}
+
+/* ================= Small UI helpers ================= */
+const Pill = ({ active, onClick, children }: any) => (
+  <button
+    onClick={onClick}
+    className={`px-4 py-2 rounded-full border text-sm font-medium transition ${
+      active ? "gradient-emerald text-white border-transparent" : "bg-surface border-app text-app bg-surface-hover"
+    }`}
+  >
+    {children}
+  </button>
+);
+
+const PRESET_TASKS = [
+  { label: "Brush & freshen up", minutes: 10, icon: Shower },
+  { label: "Exercise / yoga", minutes: 30, icon: Dumbbell },
+  { label: "Meditation / prayer", minutes: 15, icon: Sparkles },
+  { label: "Reading / revision", minutes: 20, icon: BookOpen },
+];
+
+/* ================= Component ================= */
+export default function OnboardingQuiz({ onComplete }: { onComplete: () => void }) {
+  const { theme, toggleTheme } = useThemeLocal();
   const [step, setStep] = useState(0);
-  
-  // Form state
-  const [educationType, setEducationType] = useState<'school' | 'home_school' | 'coaching'>('school');
-  const [coachingSubtype, setCoachingSubtype] = useState<'dummy' | 'residential' | ''>('');
-  const [grade, setGrade] = useState('11');
-  const [targetExams, setTargetExams] = useState<string[]>([]);
-  const [morningTasks, setMorningTasks] = useState<string[]>([]);
-  const [customMorningTask, setCustomMorningTask] = useState('');
-  const [wakeTime, setWakeTime] = useState('06:00');
-  const [sleepTime, setSleepTime] = useState('23:00');
-  const [leaveHome, setLeaveHome] = useState('07:30');
-  const [backHome, setBackHome] = useState('15:00');
-  const [commuteMinutes, setCommuteMinutes] = useState(30);
-  const [coachingStart, setCoachingStart] = useState('16:00');
-  const [coachingEnd, setCoachingEnd] = useState('20:00');
-  const [breakfastTime, setBreakfastTime] = useState('08:00');
-  const [lunchTime, setLunchTime] = useState('13:00');
-  const [dinnerTime, setDinnerTime] = useState('20:30');
-  const [mealsPerDay, setMealsPerDay] = useState(3);
-  const [peakProductivity, setPeakProductivity] = useState<'morning' | 'afternoon' | 'evening' | 'night'>('morning');
-  const [studySessionMinutes, setStudySessionMinutes] = useState(45);
-  const [breakMinutes, setBreakMinutes] = useState(10);
-  
-  const [dayPlan, setDayPlan] = useState<DayPlanSlot[]>([]);
+  const [dayPlan, setDayPlan] = useState<Slot[]>([]);
+  const [saving, setSaving] = useState(false);
 
-  // Theme toggle
-  const toggleTheme = () => {
-    const html = document.documentElement;
-    if (html.classList.contains('dark')) {
-      html.classList.remove('dark');
-      html.classList.add('light');
-      localStorage.setItem('vj_theme', 'light');
-    } else {
-      html.classList.remove('light');
-      html.classList.add('dark');
-      localStorage.setItem('vj_theme', 'dark');
-    }
-  };
+  const [a, setA] = useState<Answers>({
+    educationType: "School", coachingSubtype: "Dummy", grade: "11", exams: ["JEE Main"],
+    morningTasks: [{ label: "Brush & freshen up", minutes: 10 }],
+    wakeTime: "06:00", sleepTime: "22:30", leaveHome: "08:00", backHome: "15:00",
+    commuteMinutes: 30, coachingStart: "09:00", coachingEnd: "17:00",
+    breakfast: "07:00", lunch: "13:00", dinner: "20:00", mealsPerDay: 3,
+    peakProductivity: "Morning", studySessionMinutes: 50, breakMinutes: 10,
+  });
+  const set = (patch: Partial<Answers>) => setA((p) => ({ ...p, ...patch }));
+  const [customTask, setCustomTask] = useState("");
+  const [customMin, setCustomMin] = useState("20");
 
-  // Generate day plan based on rules
-  const generateDayPlan = () => {
-    const wakeMins = t2m(wakeTime);
-    const sleepMins = t2m(sleepTime);
-    
-    const fixedBlocks: { start: number; end: number; type: DayPlanSlot['type']; label: string }[] = [];
-
-    // Morning routine tasks
-    let routineStart = wakeMins;
-    morningTasks.forEach((task) => {
-      fixedBlocks.push({
-        start: routineStart,
-        end: routineStart + 15,
-        type: 'routine',
-        label: task,
-      });
-      routineStart += 15;
-    });
-
-    // Meals
-    const breakfastMins = t2m(breakfastTime);
-    if (breakfastMins >= wakeMins) {
-      fixedBlocks.push({ start: breakfastMins, end: breakfastMins + 20, type: 'meal', label: 'Breakfast' });
-    }
-    
-    const lunchMins = t2m(lunchTime);
-    fixedBlocks.push({ start: lunchMins, end: lunchMins + 30, type: 'meal', label: 'Lunch' });
-    
-    const dinnerMins = t2m(dinnerTime);
-    fixedBlocks.push({ start: dinnerMins, end: dinnerMins + 30, type: 'meal', label: 'Dinner' });
-
-    // School/Coaching
-    if (educationType === 'school' || educationType === 'coaching') {
-      const leaveMins = t2m(leaveHome);
-      const backMins = t2m(backHome);
-      
-      // Travel to school
-      fixedBlocks.push({
-        start: leaveMins - commuteMinutes,
-        end: leaveMins,
-        type: 'travel',
-        label: 'Commute to school',
-      });
-      
-      // School
-      fixedBlocks.push({
-        start: leaveMins,
-        end: backMins,
-        type: 'school',
-        label: educationType === 'school' ? 'School' : 'Coaching',
-      });
-      
-      // Travel home
-      fixedBlocks.push({
-        start: backMins,
-        end: backMins + commuteMinutes,
-        type: 'travel',
-        label: 'Commute home',
-      });
-    }
-
-    // Residential coaching
-    if (coachingSubtype === 'residential') {
-      const coachStartMins = t2m(coachingStart);
-      const coachEndMins = t2m(coachingEnd);
-      fixedBlocks.push({
-        start: coachStartMins,
-        end: coachEndMins,
-        type: 'school',
-        label: 'Residential Coaching',
-      });
-    }
-
-    // Sleep before wake (00:00 to wake time)
-    if (wakeMins > 0) {
-      fixedBlocks.push({ start: 0, end: wakeMins, type: 'sleep', label: 'Sleep' });
-    }
-
-    // Sort by start time
-    fixedBlocks.sort((a, b) => a.start - b.start);
-
-    // Fill study sessions between fixed blocks
-    const finalSlots: DayPlanSlot[] = [];
-    let cursor = wakeMins;
-
-    for (const block of fixedBlocks) {
-      if (block.start > cursor) {
-        // Free time gap - fill with study sessions
-        fillStudySessions(cursor, block.start, finalSlots);
-      }
-      finalSlots.push(block);
-      cursor = block.end;
-    }
-
-    // After all fixed blocks until sleep time
-    if (cursor < sleepMins) {
-      fillStudySessions(cursor, sleepMins, finalSlots);
-    }
-
-    // Final sleep block
-    finalSlots.push({ start: sleepMins, end: 1439, type: 'sleep', label: 'Sleep' });
-
-    setDayPlan(finalSlots);
-  };
-
-  const fillStudySessions = (start: number, end: number, slots: DayPlanSlot[]) => {
-    const gap = end - start;
-    
-    if (gap < 20) {
-      if (gap >= 5) {
-        slots.push({ start, end, type: 'break', label: 'Short break/free time' });
-      }
-      return;
-    }
-
-    let current = start;
-    let sessionNum = 1;
-
-    while (current + studySessionMinutes <= end) {
-      // Add study session
-      slots.push({
-        start: current,
-        end: current + studySessionMinutes,
-        type: 'study',
-        label: `Study session ${sessionNum}`,
-      });
-      current += studySessionMinutes;
-      sessionNum++;
-
-      // Check if we can add a break and another session
-      if (current + breakMinutes + studySessionMinutes <= end) {
-        slots.push({
-          start: current,
-          end: current + breakMinutes,
-          type: 'break',
-          label: 'Break',
-        });
-        current += breakMinutes;
-      }
-    }
-
-    // Leftover time
-    const leftover = end - current;
-    if (leftover >= 5) {
-      slots.push({
-        start: current,
-        end,
-        type: 'break',
-        label: 'Free time',
-      });
-    }
-  };
-
-  const handleNext = () => {
+  const next = async () => {
     if (step === 5) {
-      generateDayPlan();
+      const plan = generateDayPlan(a);
+      setDayPlan(plan);
+      try {
+        localStorage.setItem("vj_day_plan", JSON.stringify(plan));
+        localStorage.setItem("vj_onboarding_data", JSON.stringify(a));
+      } catch {}
     }
-    if (step < 6) {
-      setStep(step + 1);
+    if (step < 6) setStep(step + 1);
+  };
+
+  const finish = async () => {
+    setSaving(true);
+    try {
+      await fetch(`${BACKEND_URL}/api/onboarding/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: 1, data: a, plan: dayPlan }),
+      });
+      toast.success("Day plan saved! (backend offline is OK — stored locally)");
+    } catch {
+      toast.info("Backend not reachable — plan kept in your browser.");
     }
+    setSaving(false);
+    onComplete();
   };
 
-  const handlePrev = () => {
-    if (step > 0) {
-      setStep(step - 1);
-    }
-  };
-
-  const toggleExam = (exam: string) => {
-    setTargetExams(prev =>
-      prev.includes(exam) ? prev.filter(e => e !== exam) : [...prev, exam]
-    );
-  };
-
-  const toggleMorningTask = (task: string) => {
-    setMorningTasks(prev =>
-      prev.includes(task) ? prev.filter(t => t !== task) : [...prev, task]
-    );
-  };
-
-  const addCustomMorningTask = () => {
-    if (customMorningTask.trim()) {
-      setMorningTasks(prev => [...prev, customMorningTask.trim()]);
-      setCustomMorningTask('');
-    }
-  };
-
-  const getSlotIcon = (type: DayPlanSlot['type']) => {
-    switch (type) {
-      case 'study': return <BookOpen className="w-5 h-5 text-primary" />;
-      case 'meal': return <Utensils className="w-5 h-5 text-accent" />;
-      case 'school': return <School className="w-5 h-5 text-primary" />;
-      case 'routine': return <Sun className="w-5 h-5 text-accent" />;
-      case 'break': return <Moon className="w-5 h-5 text-muted" />;
-      case 'sleep': return <Moon className="w-5 h-5 text-muted" />;
-      case 'travel': return <Clock className="w-5 h-5 text-accent" />;
-      default: return <CheckCircle className="w-5 h-5" />;
-    }
-  };
-
-  const renderStep = () => {
-    switch (step) {
-      case 0:
-        return (
-          <div className="space-y-6">
-            <h3 className="text-xl font-bold text-app">Education Type</h3>
-            <div className="space-y-4">
-              {['school', 'home_school', 'coaching'].map((type) => (
-                <button
-                  key={type}
-                  onClick={() => setEducationType(type as any)}
-                  className={`w-full p-4 rounded-xl border text-left transition-colors ${
-                    educationType === type
-                      ? 'border-primary bg-surface-hover'
-                      : 'border-app bg-surface'
-                  }`}
-                >
-                  <span className="capitalize text-app">{type.replace('_', ' ')}</span>
-                </button>
-              ))}
-            </div>
-            {educationType === 'coaching' && (
-              <div className="space-y-4 mt-4">
-                <h4 className="text-lg font-semibold text-app">Coaching Type</h4>
-                {['dummy', 'residential'].map((subtype) => (
-                  <button
-                    key={subtype}
-                    onClick={() => setCoachingSubtype(subtype as any)}
-                    className={`w-full p-4 rounded-xl border text-left transition-colors ${
-                      coachingSubtype === subtype
-                        ? 'border-primary bg-surface-hover'
-                        : 'border-app bg-surface'
-                    }`}
-                  >
-                    <span className="capitalize text-app">{subtype}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-
-      case 1:
-        return (
-          <div className="space-y-6">
-            <h3 className="text-xl font-bold text-app">Grade & Target Exams</h3>
-            <div>
-              <label className="text-muted text-sm mb-2 block">Grade</label>
-              <select value={grade} onChange={(e) => setGrade(e.target.value)}>
-                {[9, 10, 11, 12].map(g => (
-                  <option key={g} value={g}>Class {g}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="text-muted text-sm mb-2 block">Target Exams</label>
-              <div className="flex flex-wrap gap-2">
-                {['JEE Main', 'JEE Advanced', 'NEET', 'CBSE Board', 'SSC', 'Other'].map((exam) => (
-                  <button
-                    key={exam}
-                    onClick={() => toggleExam(exam)}
-                    className={`px-4 py-2 rounded-full text-sm transition-colors ${
-                      targetExams.includes(exam)
-                        ? 'gradient-emerald text-white'
-                        : 'bg-surface text-muted border-app border'
-                    }`}
-                  >
-                    {exam}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        );
-
-      case 2:
-        return (
-          <div className="space-y-6">
-            <h3 className="text-xl font-bold text-app">Morning Routine</h3>
-            <p className="text-muted text-sm">Select your morning tasks (each takes ~15 min)</p>
-            <div className="flex flex-wrap gap-2">
-              {['Wake up & freshen up', 'Exercise', 'Meditation', 'Breakfast', 'Review notes'].map((task) => (
-                <button
-                  key={task}
-                  onClick={() => toggleMorningTask(task)}
-                  className={`px-4 py-2 rounded-full text-sm transition-colors ${
-                    morningTasks.includes(task)
-                      ? 'gradient-emerald text-white'
-                      : 'bg-surface text-muted border-app border'
-                  }`}
-                >
-                  {task}
-                </button>
-              ))}
-            </div>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={customMorningTask}
-                onChange={(e) => setCustomMorningTask(e.target.value)}
-                placeholder="Add custom task..."
-                className="flex-1"
-              />
-              <button
-                onClick={addCustomMorningTask}
-                className="p-2 gradient-emerald rounded-xl text-white"
-              >
-                <Plus className="w-5 h-5" />
-              </button>
-            </div>
-          </div>
-        );
-
-      case 3:
-        return (
-          <div className="space-y-6">
-            <h3 className="text-xl font-bold text-app">Daily Schedule</h3>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="text-muted text-sm mb-2 block">Wake Time</label>
-                <input type="time" value={wakeTime} onChange={(e) => setWakeTime(e.target.value)} />
-              </div>
-              <div>
-                <label className="text-muted text-sm mb-2 block">Sleep Time</label>
-                <input type="time" value={sleepTime} onChange={(e) => setSleepTime(e.target.value)} />
-              </div>
-              {(educationType === 'school' || educationType === 'coaching') && (
-                <>
-                  <div>
-                    <label className="text-muted text-sm mb-2 block">Leave Home</label>
-                    <input type="time" value={leaveHome} onChange={(e) => setLeaveHome(e.target.value)} />
-                  </div>
-                  <div>
-                    <label className="text-muted text-sm mb-2 block">Back Home</label>
-                    <input type="time" value={backHome} onChange={(e) => setBackHome(e.target.value)} />
-                  </div>
-                  <div>
-                    <label className="text-muted text-sm mb-2 block">Commute (min)</label>
-                    <input type="number" value={commuteMinutes} onChange={(e) => setCommuteMinutes(Number(e.target.value))} />
-                  </div>
-                </>
-              )}
-              {coachingSubtype === 'residential' && (
-                <>
-                  <div>
-                    <label className="text-muted text-sm mb-2 block">Coaching Start</label>
-                    <input type="time" value={coachingStart} onChange={(e) => setCoachingStart(e.target.value)} />
-                  </div>
-                  <div>
-                    <label className="text-muted text-sm mb-2 block">Coaching End</label>
-                    <input type="time" value={coachingEnd} onChange={(e) => setCoachingEnd(e.target.value)} />
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        );
-
-      case 4:
-        return (
-          <div className="space-y-6">
-            <h3 className="text-xl font-bold text-app">Meals & Study Preferences</h3>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="text-muted text-sm mb-2 block">Breakfast Time</label>
-                <input type="time" value={breakfastTime} onChange={(e) => setBreakfastTime(e.target.value)} />
-              </div>
-              <div>
-                <label className="text-muted text-sm mb-2 block">Lunch Time</label>
-                <input type="time" value={lunchTime} onChange={(e) => setLunchTime(e.target.value)} />
-              </div>
-              <div>
-                <label className="text-muted text-sm mb-2 block">Dinner Time</label>
-                <input type="time" value={dinnerTime} onChange={(e) => setDinnerTime(e.target.value)} />
-              </div>
-              <div>
-                <label className="text-muted text-sm mb-2 block">Meals/Day</label>
-                <input type="number" value={mealsPerDay} onChange={(e) => setMealsPerDay(Number(e.target.value))} />
-              </div>
-            </div>
-            <div className="mt-4">
-              <label className="text-muted text-sm mb-2 block">Peak Productivity</label>
-              <select value={peakProductivity} onChange={(e) => setPeakProductivity(e.target.value as any)}>
-                <option value="morning">Morning</option>
-                <option value="afternoon">Afternoon</option>
-                <option value="evening">Evening</option>
-                <option value="night">Night</option>
-              </select>
-            </div>
-            <div className="grid grid-cols-2 gap-4 mt-4">
-              <div>
-                <label className="text-muted text-sm mb-2 block">Study Session (min)</label>
-                <input type="number" value={studySessionMinutes} onChange={(e) => setStudySessionMinutes(Number(e.target.value))} />
-              </div>
-              <div>
-                <label className="text-muted text-sm mb-2 block">Break Length (min)</label>
-                <input type="number" value={breakMinutes} onChange={(e) => setBreakMinutes(Number(e.target.value))} />
-              </div>
-            </div>
-          </div>
-        );
-
-      case 5:
-        return (
-          <div className="space-y-6">
-            <h3 className="text-xl font-bold text-app">Your Generated Day Plan</h3>
-            <p className="text-muted text-sm">Based on your preferences, here's your personalized schedule</p>
-            
-            <div className="space-y-2 max-h-96 overflow-y-auto">
-              {dayPlan.map((slot, idx) => (
-                <div key={idx} className="flex items-center gap-3 p-3 bg-surface rounded-xl border-app border">
-                  {getSlotIcon(slot.type)}
-                  <div className="flex-1">
-                    <p className="text-app font-medium">{slot.label}</p>
-                    <p className="text-muted text-sm">{m2t(slot.start)} – {m2t(slot.end)}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <div className="grid grid-cols-3 gap-4 pt-4">
-              <div className="bg-surface p-3 rounded-xl text-center">
-                <p className="text-muted text-xs">Study Sessions</p>
-                <p className="text-2xl font-bold text-primary">{dayPlan.filter(s => s.type === 'study').length}</p>
-              </div>
-              <div className="bg-surface p-3 rounded-xl text-center">
-                <p className="text-muted text-xs">Total Study Time</p>
-                <p className="text-2xl font-bold text-accent">
-                  {Math.round(dayPlan.filter(s => s.type === 'study').reduce((acc, s) => acc + (s.end - s.start), 0) / 60)}h
-                </p>
-              </div>
-              <div className="bg-surface p-3 rounded-xl text-center">
-                <p className="text-muted text-xs">Break Time</p>
-                <p className="text-2xl font-bold text-primary">
-                  {Math.round(dayPlan.filter(s => s.type === 'break').reduce((acc, s) => acc + (s.end - s.start), 0) / 60)}h
-                </p>
-              </div>
-            </div>
-          </div>
-        );
-
-      case 6:
-        return (
-          <div className="space-y-6 text-center">
-            <h3 className="text-2xl font-bold text-app">You're All Set!</h3>
-            <p className="text-muted">Your personalized study plan is ready. Let's begin your learning journey!</p>
-            <div className="bg-surface p-6 rounded-xl border-app border">
-              <CheckCircle className="w-16 h-16 text-primary mx-auto mb-4" />
-              <p className="text-app font-semibold">Onboarding Complete</p>
-            </div>
-          </div>
-        );
-
-      default:
-        return null;
-    }
-  };
+  const totalStudy = dayPlan.filter((s) => s.type === "study").reduce((n, s) => n + (s.end - s.start), 0);
+  const nSessions = dayPlan.filter((s) => s.type === "study").length;
 
   return (
-    <div className="min-h-screen bg-app flex flex-col">
-      {/* Header */}
-      <div className="p-4 flex justify-between items-center border-b border-app">
-        <div className="flex items-center gap-2">
-          <span className="text-muted text-sm">Step {step + 1} of 7</span>
-          <div className="w-32 h-2 bg-surface rounded-full overflow-hidden">
-            <div
-              className="h-full gradient-emerald transition-all"
-              style={{ width: `${((step + 1) / 7) * 100}%` }}
-            />
-          </div>
+    <div className="min-h-screen bg-app text-app flex items-center justify-center p-4">
+      <button onClick={toggleTheme} className="fixed top-4 right-4 z-50 p-2 rounded-lg border border-app bg-surface">
+        {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
+      </button>
+      <div className="w-full max-w-2xl bg-surface border border-app rounded-2xl p-6 md:p-8 shadow-xl">
+        {/* Progress */}
+        <div className="flex items-center gap-2 mb-6">
+          {Array.from({ length: 7 }).map((_, i) => (
+            <div key={i} className={`h-1.5 flex-1 rounded-full ${i <= step ? "gradient-emerald" : "bg-[var(--border)]"}`} />
+          ))}
         </div>
-        <button
-          onClick={toggleTheme}
-          className="p-2 bg-surface rounded-xl border-app border"
-        >
-          <Sun className="w-5 h-5 text-app hidden dark:block" />
-          <Moon className="w-5 h-5 text-app block dark:hidden" />
-        </button>
-      </div>
+        <p className="text-muted text-xs mb-1">Step {step + 1} of 7</p>
 
-      {/* Content */}
-      <div className="flex-1 flex items-center justify-center p-4">
-        <div className="w-full max-w-lg">
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={step}
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              transition={{ duration: 0.2 }}
-              className="bg-surface p-6 rounded-2xl border-app border shadow-xl"
-            >
-              {renderStep()}
-
-              {/* Navigation */}
-              <div className="flex justify-between mt-8">
-                <button
-                  onClick={handlePrev}
-                  disabled={step === 0}
-                  className={`px-6 py-2 rounded-xl font-medium transition-colors ${
-                    step === 0
-                      ? 'text-muted cursor-not-allowed'
-                      : 'text-app bg-surface-hover hover:bg-surface'
-                  }`}
-                >
-                  Back
-                </button>
-                {step < 6 ? (
-                  <button
-                    onClick={handleNext}
-                    className="px-6 py-2 gradient-emerald text-white rounded-xl font-medium flex items-center gap-2"
-                  >
-                    Next <ArrowRight className="w-4 h-4" />
-                  </button>
-                ) : (
-                  <button
-                    onClick={onComplete}
-                    className="px-6 py-2 gradient-emerald text-white rounded-xl font-medium"
-                  >
-                    Start Learning
-                  </button>
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={step}
+            initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -30 }}
+            transition={{ duration: 0.25 }}
+          >
+            {/* STEP 0 — education type */}
+            {step === 0 && (
+              <Step title="How do you study?" icon={<School size={20} />}>
+                <div className="flex flex-wrap gap-2">
+                  {(["School", "Home School", "Coaching"] as const).map((t) => (
+                    <Pill key={t} active={a.educationType === t} onClick={() => set({ educationType: t })}>{t}</Pill>
+                  ))}
+                </div>
+                {a.educationType === "Coaching" && (
+                  <div className="mt-4 flex gap-2">
+                    {(["Dummy", "Residential"] as const).map((t) => (
+                      <Pill key={t} active={a.coachingSubtype === t} onClick={() => set({ coachingSubtype: t })}>{t} Coaching</Pill>
+                    ))}
+                  </div>
                 )}
-              </div>
-            </motion.div>
-          </AnimatePresence>
+              </Step>
+            )}
+
+            {/* STEP 1 — grade + exams */}
+            {step === 1 && (
+              <Step title="Grade & target exams" icon={<BookOpen size={20} />}>
+                <select value={a.grade} onChange={(e) => set({ grade: e.target.value })} className="mb-4">
+                  {["8","9","10","11","12","Drop year"].map((g) => <option key={g}>{g}</option>)}
+                </select>
+                <div className="flex flex-wrap gap-2">
+                  {["JEE Main", "JEE Advanced", "NEET", "CBSE Boards", "SSC", "Olympiads"].map((ex) => (
+                    <Pill key={ex} active={a.exams.includes(ex)}
+                      onClick={() => set({ exams: a.exams.includes(ex) ? a.exams.filter((x) => x !== ex) : [...a.exams, ex] })}>
+                      {ex}
+                    </Pill>
+                  ))}
+                </div>
+              </Step>
+            )}
+
+            {/* STEP 2 — morning routine */}
+            {step === 2 && (
+              <Step title="Morning routine" icon={<Sunrise size={20} />}>
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {PRESET_TASKS.map((t) => {
+                    const on = a.morningTasks.some((m) => m.label === t.label);
+                    return (
+                      <Pill key={t.label} active={on}
+                        onClick={() => set({ morningTasks: on ? a.morningTasks.filter((m) => m.label !== t.label) : [...a.morningTasks, { label: t.label, minutes: t.minutes }] })}>
+                        {t.label} ({t.minutes}m)
+                      </Pill>
+                    );
+                  })}
+                </div>
+                <div className="flex gap-2">
+                  <input placeholder="Custom task…" value={customTask} onChange={(e) => setCustomTask(e.target.value)} />
+                  <input type="number" placeholder="min" value={customMin} onChange={(e) => setCustomMin(e.target.value)} className="!w-24" />
+                  <button className="px-4 rounded-lg gradient-emerald text-white whitespace-nowrap"
+                    onClick={() => { if (customTask.trim()) { set({ morningTasks: [...a.morningTasks, { label: customTask.trim(), minutes: Number(customMin) || 15 }] }); setCustomTask(""); } }}>
+                    Add
+                  </button>
+                </div>
+              </Step>
+            )}
+
+            {/* STEP 3 — schedule */}
+            {step === 3 && (
+              <Step title="Daily schedule" icon={<CalendarDays size={20} />}>
+                <div className="grid grid-cols-2 gap-4">
+                  <Field label="Wake up"><input type="time" value={a.wakeTime} onChange={(e) => set({ wakeTime: e.target.value })} /></Field>
+                  <Field label="Sleep"><input type="time" value={a.sleepTime} onChange={(e) => set({ sleepTime: e.target.value })} /></Field>
+                  {(a.educationType === "School" || a.coachingSubtype === "Dummy") && (<>
+                    <Field label="Leave home"><input type="time" value={a.leaveHome} onChange={(e) => set({ leaveHome: e.target.value })} /></Field>
+                    <Field label="Back home"><input type="time" value={a.backHome} onChange={(e) => set({ backHome: e.target.value })} /></Field>
+                    <Field label="Commute (one way, min)"><input type="number" value={a.commuteMinutes} onChange={(e) => set({ commuteMinutes: Number(e.target.value) || 0 })} /></Field>
+                  </>)}
+                  {a.educationType === "Coaching" && a.coachingSubtype === "Residential" && (<>
+                    <Field label="Coaching start"><input type="time" value={a.coachingStart} onChange={(e) => set({ coachingStart: e.target.value })} /></Field>
+                    <Field label="Coaching end"><input type="time" value={a.coachingEnd} onChange={(e) => set({ coachingEnd: e.target.value })} /></Field>
+                  </>)}
+                </div>
+              </Step>
+            )}
+
+            {/* STEP 4 — meals */}
+            {step === 4 && (
+              <Step title="Meals" icon={<Utensils size={20} />}>
+                <div className="grid grid-cols-2 gap-4">
+                  <Field label="Breakfast"><input type="time" value={a.breakfast} onChange={(e) => set({ breakfast: e.target.value })} /></Field>
+                  <Field label="Lunch"><input type="time" value={a.lunch} onChange={(e) => set({ lunch: e.target.value })} /></Field>
+                  <Field label="Dinner"><input type="time" value={a.dinner} onChange={(e) => set({ dinner: e.target.value })} /></Field>
+                  <Field label="Meals per day"><input type="number" min={2} max={6} value={a.mealsPerDay} onChange={(e) => set({ mealsPerDay: Number(e.target.value) })} /></Field>
+                </div>
+              </Step>
+            )}
+
+            {/* STEP 5 — study preferences */}
+            {step === 5 && (
+              <Step title="Study preferences" icon={<Brain size={20} />}>
+                <p className="text-muted text-sm mb-2">Peak productivity time</p>
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {(["Morning", "Afternoon", "Evening", "Night"] as const).map((p) => (
+                    <Pill key={p} active={a.peakProductivity === p} onClick={() => set({ peakProductivity: p })}>{p}</Pill>
+                  ))}
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <Field label="Study session length (min)"><input type="number" value={a.studySessionMinutes} onChange={(e) => set({ studySessionMinutes: Number(e.target.value) || 50 })} /></Field>
+                  <Field label="Break length (min)"><input type="number" value={a.breakMinutes} onChange={(e) => set({ breakMinutes: Number(e.target.value) || 10 })} /></Field>
+                </div>
+              </Step>
+            )}
+
+            {/* STEP 6 — generated plan */}
+            {step === 6 && (
+              <Step title="Your day plan ✨" icon={<Coffee size={20} />}>
+                <div className="flex gap-3 mb-4 text-xs">
+                  <span className="px-3 py-1 rounded-full bg-surface border border-app">{nSessions} study sessions</span>
+                  <span className="px-3 py-1 rounded-full bg-surface border border-app">{Math.round(totalStudy / 6)} h {totalStudy % 60} m study/day</span>
+                  <span className="px-3 py-1 rounded-full bg-surface border border-app">{dayPlan.length} blocks</span>
+                </div>
+                <div className="max-h-80 overflow-y-auto pr-2 space-y-1">
+                  {dayPlan.map((s, i) => (
+                    <div key={i} className="flex items-center gap-3 p-2 rounded-lg bg-[var(--bg)] border border-app text-sm">
+                      <span className="font-mono text-xs text-muted w-24">{m2t(s.start)}–{m2t(s.end)}</span>
+                      <TypeIcon type={s.type} />
+                      <span className="capitalize">{s.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </Step>
+            )}
+          </motion.div>
+        </AnimatePresence>
+
+        {/* Nav buttons */}
+        <div className="flex justify-between mt-6">
+          <button disabled={step === 0} onClick={() => setStep(step - 1)}
+            className="flex items-center gap-1 px-4 py-2 rounded-lg border border-app text-muted disabled:opacity-30">
+            <ChevronLeft size={16} /> Back
+          </button>
+          {step < 6 ? (
+            <button onClick={next} className="flex items-center gap-1 px-5 py-2 rounded-lg gradient-emerald text-white font-semibold">
+              Next <ChevronRight size={16} />
+            </button>
+          ) : (
+            <button onClick={finish} disabled={saving} className="px-5 py-2 rounded-lg gradient-emerald text-white font-semibold disabled:opacity-60">
+              {saving ? "Saving…" : "Start Learning 🚀"}
+            </button>
+          )}
         </div>
       </div>
     </div>
   );
 }
+
+/* Reuse the theme hook without circular import issues */
+function useThemeLocal() {
+  const [theme, setTheme] = useState<"dark" | "light">(() =>
+    localStorage.getItem("vj_theme") === "light" ? "light" : "dark");
+  const toggleTheme = () => {
+    const root = document.documentElement;
+    const nextT = theme === "dark" ? "light" : "dark";
+    root.classList.remove("dark", "light");
+    root.classList.add(nextT);
+    localStorage.setItem("vj_theme", nextT);
+    setTheme(nextT);
+  };
+  return { theme, toggleTheme };
+}
+
+const Step = ({ title, icon, children }: any) => (
+  <div>
+    <h2 className="text-xl font-bold mb-4 flex items-center gap-2">{icon}{title}</h2>
+    {children}
+  </div>
+);
+
+const Field = ({ label, children }: any) => (
+  <label className="block">
+    <span className="text-xs text-muted">{label}</span>
+    {children}
+  </label>
+);
+
+const TypeIcon = ({ type }: { type: SlotType }) => {
+  const map: Record<SlotType, any> = {
+    study: BookOpen, meal: Utensils, school: School, routine: Sunrise,
+    break: Coffee, sleep: Moon, travel: Bus,
+  };
+  const I = map[type];
+  const colors: Record<SlotType, string> = {
+    study: "text-[var(--primary)]", meal: "text-orange-400", school: "text-sky-400",
+    routine: "text-purple-400", break: "text-yellow-400", sleep: "text-indigo-400", travel: "text-pink-400",
+  };
+  return <I size={16} className={colors[type]} />;
+};

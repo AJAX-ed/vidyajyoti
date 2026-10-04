@@ -2,9 +2,15 @@
 <html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>VidyaJyoti - Exam Preparation Platform</title>
+    <title>VidyaJyoti — Exam Prep, Reimagined</title>
+    <script>
+      // Apply saved theme before first paint to avoid flash.
+      try {
+        var t = localStorage.getItem("vj_theme") || "dark";
+        document.documentElement.className = t;
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

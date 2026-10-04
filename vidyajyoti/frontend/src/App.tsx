@@ -1,58 +1,67 @@
-import { useState, useEffect } from 'react';
-import LoginPage from './views/LoginPage';
-import OnboardingQuiz from './views/OnboardingQuiz';
-import Dashboard from './views/Dashboard';
+import { useEffect, useState } from "react";
+import { Toaster } from "sonner";
+import LoginPage from "./views/LoginPage";
+import OnboardingQuiz from "./views/OnboardingQuiz";
+import Dashboard from "./views/Dashboard";
 
-type AppState = 'login' | 'onboarding' | 'app';
+export type AppState = "login" | "onboarding" | "app";
 
-function App() {
-  const [appState, setAppState] = useState<AppState>('login');
+/* ---------- Theme hook: toggles dark/light on <html>, persists to localStorage ---------- */
+export function useTheme() {
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    const saved = localStorage.getItem("vj_theme");
+    return saved === "light" ? "light" : "dark";
+  });
 
   useEffect(() => {
-    // Check localStorage on mount
-    const token = localStorage.getItem('vj_token');
-    const userName = localStorage.getItem('vj_user_name');
-    const onboarded = localStorage.getItem('vj_onboarded');
+    const root = document.documentElement;
+    root.classList.remove("dark", "light");
+    root.classList.add(theme);
+    localStorage.setItem("vj_theme", theme);
+  }, [theme]);
 
-    if (token && userName) {
-      if (onboarded === 'true') {
-        setAppState('app');
-      } else {
-        setAppState('onboarding');
-      }
+  const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
+  return { theme, toggleTheme };
+}
+
+export default function App() {
+  const [appState, setAppState] = useState<AppState>("login");
+
+  /* Restore session on startup */
+  useEffect(() => {
+    const token = localStorage.getItem("vj_token");
+    const name = localStorage.getItem("vj_user_name");
+    if (token && name) {
+      setAppState(localStorage.getItem("vj_onboarded") === "true" ? "app" : "onboarding");
     } else {
-      setAppState('login');
+      setAppState("login");
     }
   }, []);
 
-  const handleLogin = (userName?: string) => {
-    localStorage.setItem('vj_token', 'fake-login-token');
-    localStorage.setItem('vj_user_name', userName || 'Student');
-    setAppState('onboarding');
+  const handleLogin = (name?: string) => {
+    localStorage.setItem("vj_token", "fake-login");
+    localStorage.setItem("vj_user_name", name || "Student");
+    setAppState("onboarding");
   };
 
   const handleOnboardingComplete = () => {
-    localStorage.setItem('vj_onboarded', 'true');
-    setAppState('app');
+    localStorage.setItem("vj_onboarded", "true");
+    setAppState("app");
   };
 
   const handleLogout = () => {
-    // Remove all vj_* keys
-    Object.keys(localStorage).forEach((key) => {
-      if (key.startsWith('vj_')) {
-        localStorage.removeItem(key);
-      }
-    });
-    setAppState('login');
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith("vj_"))
+      .forEach((k) => localStorage.removeItem(k));
+    setAppState("login");
   };
 
   return (
-    <div className="bg-app min-h-screen text-app">
-      {appState === 'login' && <LoginPage onLogin={handleLogin} />}
-      {appState === 'onboarding' && <OnboardingQuiz onComplete={handleOnboardingComplete} />}
-      {appState === 'app' && <Dashboard onLogout={handleLogout} />}
-    </div>
+    <>
+      <Toaster position="top-center" richColors />
+      {appState === "login" && <LoginPage onLogin={handleLogin} />}
+      {appState === "onboarding" && <OnboardingQuiz onComplete={handleOnboardingComplete} />}
+      {appState === "app" && <Dashboard onLogout={handleLogout} />}
+    </>
   );
 }
-
-export default App;

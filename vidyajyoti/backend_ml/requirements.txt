@@ -1,25 +1,10 @@
-# VidyaJyoti ML Service - Self-Hosted AI Models
-
-# Core ML frameworks (ranges, not pins — exact pins like torch==2.5.1 /
-# asyncpg==0.30.0 have no wheels for every OS + Python-version combo)
-torch>=2.3.0
-transformers>=4.44
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+# All self-hosted, open-source ML — NO external AI APIs.
+numpy>=1.26
+scikit-learn>=1.4
+faiss-cpu>=1.8
 sentence-transformers>=3.0
-scikit-learn>=1.5
-
-# Vector store and embeddings
-faiss-cpu>=1.8.0
-pgvector>=0.2.5
-
-# FastAPI for ML service
-fastapi>=0.115,<0.116
-uvicorn[standard]>=0.34,<0.35
-
-# Database (optional, for storing model metadata)
-sqlalchemy[asyncio]>=2.0.36,<2.1
-asyncpg>=0.29
-
-# Utilities
-numpy>=1.26.0,<3
-pandas>=2.2.0
-pydantic>=2.10,<3
+torch>=2.2
+transformers>=4.44

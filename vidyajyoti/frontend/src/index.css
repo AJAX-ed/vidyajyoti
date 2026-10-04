@@ -1,64 +1,49 @@
 @import "tailwindcss";
 
-:root {
-  /* Dark theme (default) */
-  --bg: #0f172a;
-  --surface: #1e293b;
-  --surface-hover: #334155;
-  --border: #334155;
-  --text: #f1f5f9;
-  --text-muted: #94a3b8;
+/* ---------- Theme variables ---------- */
+:root,
+html.dark {
+  --bg: #0a0f0d;
+  --surface: #121a16;
+  --surface-hover: #1a2520;
+  --border: #24332c;
+  --text: #e8f0ec;
+  --text-muted: #8fa39a;
   --primary: #10b981;
-  --accent: #8b5cf6;
+  --accent: #f59e0b;
 }
 
+html.light,
 .light {
-  /* Light theme */
-  --bg: #f8fafc;
+  --bg: #f6f8f7;
   --surface: #ffffff;
-  --surface-hover: #f1f5f9;
-  --border: #e2e8f0;
-  --text: #0f172a;
-  --text-muted: #64748b;
+  --surface-hover: #eef2f0;
+  --border: #d8e0dc;
+  --text: #10201a;
+  --text-muted: #5a6b63;
   --primary: #059669;
-  --accent: #7c3aed;
+  --accent: #d97706;
 }
 
-.bg-app {
-  background-color: var(--bg);
-}
-
-.bg-surface {
-  background-color: var(--surface);
-}
-
-.bg-surface-hover {
-  background-color: var(--surface-hover);
-}
-
-.text-app {
-  color: var(--text);
-}
-
-.text-muted {
-  color: var(--text-muted);
-}
-
-.border-app {
-  border-color: var(--border);
-}
+/* ---------- Utility classes ---------- */
+.bg-app { background-color: var(--bg); }
+.bg-surface { background-color: var(--surface); }
+.bg-surface-hover:hover { background-color: var(--surface-hover); }
+.text-app { color: var(--text); }
+.text-muted { color: var(--text-muted); }
+.border-app { border-color: var(--border); }
 
 .gradient-emerald {
-  background-image: linear-gradient(to right, #10b981, #059669);
+  background-image: linear-gradient(135deg, #10b981 0%, #059669 50%, #047857 100%);
 }
-
 .text-gradient-emerald {
-  background-image: linear-gradient(to right, #10b981, #059669);
+  background-image: linear-gradient(135deg, #34d399, #10b981, #f59e0b);
   -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
   background-clip: text;
+  color: transparent;
 }
 
+/* ---------- Global input/select styles ---------- */
 input,
 select {
   background-color: var(--bg);
@@ -76,16 +61,12 @@ select:focus {
   border-color: var(--primary);
 }
 
+/* ---------- Smooth transitions ---------- */
 * {
   transition: background-color 0.2s, border-color 0.2s, color 0.2s;
 }
 
-html, body, #root {
-  height: 100%;
-  margin: 0;
-  padding: 0;
-}
-
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }

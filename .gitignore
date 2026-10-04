@@ -1,7 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
 # Logs
 *.log
-.vj_logs/
 
-# Python compiled files
-__pycache__/
-*.pyc
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo

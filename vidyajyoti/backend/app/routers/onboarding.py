@@ -1,115 +1,40 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import Optional
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..database import get_db
-from ..models import User
-from ..schemas import (
-    OnboardingSaveRequest,
-    OnboardingSaveResponse,
-    OnboardingGetResponse,
-    OnboardingData,
-    DayPlanSlot,
-)
+from app.database import AsyncSessionLocal
+from app.models import User
+from app.schemas import OnboardingSaveRequest, OnboardingSaveResponse, OnboardingGetResponse
 
 router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
 
 
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
 @router.post("/save", response_model=OnboardingSaveResponse)
-async def save_onboarding(
-    request: OnboardingSaveRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Save onboarding data and day plan for a user.
-    
-    This endpoint stores:
-    - The quiz answers (education type, schedule, preferences, etc.)
-    - The generated day plan (timeline of slots)
-    
-    In production, this would create or update the User record.
-    For now, it returns a success response.
-    """
-    try:
-        # Check if user exists
-        result = await db.execute(select(User).where(User.id == request.user_id))
-        user = result.scalar_one_or_none()
-        
-        if not user:
-            # Create new user
-            user = User(
-                id=request.user_id,
-                name=f"User_{request.user_id}",
-                role="student"
-            )
-            db.add(user)
-        
-        # Convert Pydantic models to dict for JSON storage
-        onboarding_data_dict = request.data.model_dump()
-        day_plan_list = [slot.model_dump() for slot in request.plan]
-        
-        # Update user's onboarding data and day plan
-        user.onboarding_data = onboarding_data_dict
-        user.day_plan = day_plan_list
-        
-        await db.commit()
-        await db.refresh(user)
-        
-        return OnboardingSaveResponse(
-            success=True,
-            message="Onboarding data saved successfully"
-        )
-        
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+async def save_onboarding(req: OnboardingSaveRequest, db: AsyncSession = Depends(get_db)):
+    user = await db.get(User, req.user_id)
+    if user is None:
+        # auto-create demo user so the flow works out of the box
+        user = User(id=req.user_id, name="Student", role="student")
+        db.add(user)
+    user.onboarding_data = req.data
+    user.day_plan = [slot.model_dump() for slot in req.plan]
+    await db.commit()
+    return OnboardingSaveResponse(ok=True, user_id=req.user_id, slots_saved=len(req.plan))
 
 
 @router.get("/{user_id}", response_model=OnboardingGetResponse)
-async def get_onboarding(
-    user_id: int,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get onboarding status and data for a user.
-    
-    Returns:
-    - onboarded: boolean indicating if user completed onboarding
-    - data: the quiz answers (if onboarded)
-    - plan: the generated day plan (if onboarded)
-    """
+async def get_onboarding(user_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
-    
-    if not user:
-        return OnboardingGetResponse(
-            onboarded=False,
-            data=None,
-            plan=None
-        )
-    
-    if user.onboarding_data is None:
-        return OnboardingGetResponse(
-            onboarded=False,
-            data=None,
-            plan=None
-        )
-    
-    # Parse stored data back to Pydantic models
-    try:
-        onboarding_data = OnboardingData(**user.onboarding_data)
-        day_plan = [DayPlanSlot(**slot) for slot in user.day_plan] if user.day_plan else []
-    except Exception:
-        # If parsing fails, return raw data
-        return OnboardingGetResponse(
-            onboarded=True,
-            data=user.onboarding_data,  # type: ignore
-            plan=user.day_plan  # type: ignore
-        )
-    
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
     return OnboardingGetResponse(
-        onboarded=True,
-        data=onboarding_data,
-        plan=day_plan
+        onboarded=user.day_plan is not None,
+        data=user.onboarding_data,
+        plan=user.day_plan,
     )

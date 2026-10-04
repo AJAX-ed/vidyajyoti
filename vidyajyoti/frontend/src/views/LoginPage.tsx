@@ -1,84 +1,80 @@
-import { BookOpen, Trophy, Target, Users } from 'lucide-react';
+import { useState } from "react";
+import { motion } from "framer-motion";
+import { GraduationCap, Target, CalendarClock, Brain, Moon, Sun, Sparkles } from "lucide-react";
+import { useTheme } from "../App";
 
-interface LoginPageProps {
-  onLogin: (userName?: string) => void;
-}
+const FEATURES = [
+  { icon: CalendarClock, title: "Smart Day Plans", desc: "Timelines built around your real routine." },
+  { icon: Target, title: "Exam Focused", desc: "JEE · NEET · CBSE · SSC — all in one place." },
+  { icon: Brain, title: "Own AI Models", desc: "Self-hosted personalisation. No external AI APIs." },
+  { icon: Sparkles, title: "Battlegrounds", desc: "Gamified quizzes with points & coins." },
+];
 
-export default function LoginPage({ onLogin }: LoginPageProps) {
+export default function LoginPage({ onLogin }: { onLogin: (name?: string) => void }) {
+  const { theme, toggleTheme } = useTheme();
+  const [name, setName] = useState("");
+
   return (
-    <div className="min-h-screen flex">
-      {/* Left side - Branding (hidden on mobile) */}
-      <div className="hidden lg:flex lg:w-1/2 bg-surface p-12 flex-col justify-between">
-        <div>
-          <div className="flex items-center gap-3 mb-8">
-            <div className="w-12 h-12 gradient-emerald rounded-xl flex items-center justify-center">
-              <BookOpen className="w-7 h-7 text-white" />
-            </div>
-            <h1 className="text-2xl font-bold text-gradient-emerald">VidyaJyoti</h1>
+    <div className="min-h-screen bg-app text-app flex">
+      {/* Theme toggle visible on all screens */}
+      <button
+        onClick={toggleTheme}
+        className="fixed top-4 right-4 z-50 p-2 rounded-lg border border-app bg-surface"
+        aria-label="Toggle theme"
+      >
+        {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
+      </button>
+
+      {/* LEFT: branding (desktop only) */}
+      <div className="hidden lg:flex flex-col justify-center flex-1 p-12 gradient-emerald text-white">
+        <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6 }}>
+          <div className="flex items-center gap-3 mb-6">
+            <GraduationCap size={40} />
+            <h1 className="text-4xl font-bold">VidyaJyoti</h1>
           </div>
-          
-          <h2 className="text-4xl font-bold text-app mb-6">
-            Your Personal Exam Preparation Companion
-          </h2>
-          <p className="text-muted text-lg mb-8">
-            Smart study plans, gamified learning, and personalized guidance for JEE, NEET, CBSE, and more.
+          <p className="text-xl opacity-90 mb-10 max-w-md">
+            The light of knowledge — plan your day, master your exam, level up every battle.
           </p>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div className="bg-app p-4 rounded-xl border-app border">
-              <Target className="w-8 h-8 text-primary mb-3" />
-              <h3 className="font-semibold text-app mb-1">Target Exams</h3>
-              <p className="text-muted text-sm">JEE Main, NEET, CBSE, SSC</p>
-            </div>
-            <div className="bg-app p-4 rounded-xl border-app border">
-              <Trophy className="w-8 h-8 text-accent mb-3" />
-              <h3 className="font-semibold text-app mb-1">Gamified Learning</h3>
-              <p className="text-muted text-sm">Earn points, compete with peers</p>
-            </div>
-            <div className="bg-app p-4 rounded-xl border-app border">
-              <BookOpen className="w-8 h-8 text-primary mb-3" />
-              <h3 className="font-semibold text-app mb-1">Smart Plans</h3>
-              <p className="text-muted text-sm">AI-powered study schedules</p>
-            </div>
-            <div className="bg-app p-4 rounded-xl border-app border">
-              <Users className="w-8 h-8 text-accent mb-3" />
-              <h3 className="font-semibold text-app mb-1">Community</h3>
-              <p className="text-muted text-sm">Learn together, grow together</p>
-            </div>
+          <div className="grid grid-cols-2 gap-4 max-w-lg">
+            {FEATURES.map((f) => (
+              <div key={f.title} className="bg-white/10 backdrop-blur rounded-xl p-4 border border-white/20">
+                <f.icon className="mb-2" size={22} />
+                <h3 className="font-semibold">{f.title}</h3>
+                <p className="text-sm opacity-80">{f.desc}</p>
+              </div>
+            ))}
           </div>
-        </div>
-
-        <p className="text-muted text-sm">© 2024 VidyaJyoti. All rights reserved.</p>
+        </motion.div>
       </div>
 
-      {/* Right side - Login card */}
-      <div className="w-full lg:w-1/2 flex items-center justify-center p-8 bg-app">
-        <div className="w-full max-w-md">
-          <div className="lg:hidden flex items-center gap-3 mb-8">
-            <div className="w-10 h-10 gradient-emerald rounded-xl flex items-center justify-center">
-              <BookOpen className="w-6 h-6 text-white" />
-            </div>
-            <h1 className="text-xl font-bold text-gradient-emerald">VidyaJyoti</h1>
+      {/* RIGHT: login card (always visible; only card on mobile) */}
+      <div className="flex-1 flex items-center justify-center p-6">
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="w-full max-w-md bg-surface border border-app rounded-2xl p-8 shadow-xl"
+        >
+          <div className="flex items-center gap-2 mb-2 lg:hidden">
+            <GraduationCap size={28} className="text-[var(--primary)]" />
+            <span className="text-2xl font-bold text-gradient-emerald">VidyaJyoti</span>
           </div>
-
-          <div className="bg-surface p-8 rounded-2xl border-app border shadow-xl">
-            <div className="text-center mb-8">
-              <h2 className="text-2xl font-bold text-app mb-2">Welcome Back!</h2>
-              <p className="text-muted">Sign in to continue your learning journey</p>
-            </div>
-
-            <button
-              onClick={() => onLogin('Student')}
-              className="w-full gradient-emerald text-white font-semibold py-3 px-6 rounded-xl hover:opacity-90 transition-opacity"
-            >
-              Login as Student
-            </button>
-
-            <p className="text-muted text-sm text-center mt-6">
-              By logging in, you agree to our Terms of Service and Privacy Policy.
-            </p>
-          </div>
-        </div>
+          <h2 className="text-2xl font-bold mb-1">Welcome back 🪔</h2>
+          <p className="text-muted text-sm mb-6">
+            Start your study journey — no signup needed for this demo.
+          </p>
+          <input
+            placeholder="Your name (optional)"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="mb-4"
+          />
+          <button
+            onClick={() => onLogin(name.trim() || undefined)}
+            className="w-full gradient-emerald text-white font-semibold py-3 rounded-xl hover:opacity-90"
+          >
+            Login
+          </button>
+        </motion.div>
       </div>
     </div>
   );
