@@ -12,8 +12,18 @@
       } catch (e) {}
     </script>
   </head>
-  <body>
+  <body style="background-color:#0a0f0d">
     <div id="root"></div>
+    <!-- No-JS diagnostic: if the JS bundle never executes (blocked, bad
+         proxy, corrupted node_modules), the user sees THIS message instead
+         of a blank white screen. main.tsx removes it once React mounts. -->
+    <noscript>
+      <pre style="color:#e8f0ec;padding:2rem;font-family:monospace;white-space:pre-wrap">
+VidyaJyoti needs JavaScript enabled in your browser to run.</pre>
+    </noscript>
+    <div id="vj-boot" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#8fa39a;font-family:ui-sans-serif,system-ui,sans-serif;background:#0a0f0d">
+      Loading VidyaJyoti…
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

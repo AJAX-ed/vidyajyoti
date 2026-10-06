@@ -27,6 +27,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -49,6 +50,7 @@ PG_PORT = 5432
 PG_USER, PG_PASS, PG_DB = "vj_user", "vj_password", "vidyajyoti"
 
 PROCESSES: list[subprocess.Popen] = []
+ACTUAL_FRONTEND_PORT = 3000   # set by start_frontend() if :3000 was occupied
 
 
 # ------------------------------------------------------------------ helpers
@@ -90,6 +92,25 @@ def wait_for_port(port: int, timeout: float = 60.0) -> bool:
     t0 = time.time()
     while time.time() - t0 < timeout:
         if port_open(port):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def http_ok(url: str, timeout: float = 2.0) -> bool:
+    """GET a URL and return True only on a real HTTP 2xx/3xx/4xx response."""
+    try:
+        from urllib.request import urlopen
+        with urlopen(url, timeout=timeout) as r:
+            return 200 <= r.status < 500
+    except Exception:
+        return False
+
+
+def wait_for_http(url: str, timeout: float = 90.0) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if http_ok(url):
             return True
         time.sleep(0.5)
     return False
@@ -142,10 +163,33 @@ def ensure_module(import_name: str, pip_name: str | None = None):
         return False
 
 
+def syntax_preflight():
+    """Fast (stdlib-only) compile check of every .py in the project. A single
+    broken file used to make ml_service hang at 'Waiting for application
+    startup' with no visible cause; now we print it before launching."""
+    bad = []
+    for base in (BACKEND_DIR, ML_DIR):
+        for p in sorted(base.rglob("*.py")):
+            if ".venv" in p.parts:
+                continue
+            try:
+                compile(p.read_text(encoding="utf-8", errors="ignore"),
+                        str(p), "exec")
+            except SyntaxError as e:
+                bad.append((p, f"line {e.lineno}: {e.msg}"))
+    if bad:
+        warn("Python syntax errors found — services WILL fail until fixed:")
+        for p, msg in bad:
+            print(f"   ✗ {p.relative_to(ROOT)}\n     {msg}")
+    else:
+        ok("All backend/ML Python files compile cleanly.")
+
+
 def step0_python_modules():
     banner("STEP 0 — Checking required Python modules")
     ensure_module("psutil")
     ensure_module("psycopg2", "psycopg2-binary")
+    syntax_preflight()
 
 
 # ------------------------------------------------------------------ STEP 1
@@ -208,6 +252,42 @@ def _refresh_path():
             os.environ["PATH"] += os.pathsep + p
 
 
+def _frontend_deps_healthy(nm: Path) -> bool:
+    """True only if node_modules actually contains what Vite needs to RUN.
+
+    A previous interrupted/corrupted npm install left trees that EXIST but are
+    incomplete (e.g. rollup's platform binary package missing → vite crashes
+    with MODULE_NOT_FOUND at startup, which looked like 'blank white screen').
+    We therefore check for the critical files, not just the folder."""
+    checks = [
+        nm / "vite" / "bin" / "vite.js",
+        nm / "react" / "index.js",
+        nm / "react-dom" / "client.js",
+        nm / "@vitejs" / "plugin-react" / "package.json",
+        nm / "tailwindcss" / "package.json",
+        nm / "@tailwindcss" / "vite" / "package.json",
+        nm / "framer-motion" / "package.json",
+        nm / "lucide-react" / "package.json",
+        nm / "sonner" / "package.json",
+    ]
+    if not all(p.exists() for p in checks):
+        return False
+    # Rollup loads a PLATFORM-SPECIFIC native package at require-time
+    # (rollup/dist/native.js). If npm skipped the optional dep (Windows,
+    # interrupted install, --no-optional), vite dies instantly. Verify one
+    # matching the current platform exists.
+    try:
+        rm = nm / "rollup" / "dist" / "native.js"
+        if rm.exists():
+            plat = {"nt": "win32", "posix": sys.platform.replace("darwin", "darwin")}.get(os.name, "linux")
+            variants = list((nm / "@rollup").glob(f"rollup-{plat}*"))
+            if not variants:
+                return False
+    except Exception:
+        return False
+    return True
+
+
 def step1_node(do_install: bool):
     banner("STEP 1 — Node.js & frontend dependencies")
     npm, node = find_npm()
@@ -220,20 +300,42 @@ def step1_node(do_install: bool):
     ok(f"Node.js/npm found: {npm}")
     lock = FRONTEND_DIR / "package-lock.json"
     nm = FRONTEND_DIR / "node_modules"
-    if not nm.exists() or not lock.exists():
+    healthy = nm.exists() and lock.exists() and _frontend_deps_healthy(nm)
+    if not healthy:
+        if nm.exists():
+            info("node_modules present but INCOMPLETE/CORRUPTED (missing vite/"
+                 "react/rollup-binary files) — reinstalling cleanly ...")
+            shutil.rmtree(nm, ignore_errors=True)
         info("Installing frontend dependencies (npm install) ...")
         rc = run([npm, "install"], cwd=FRONTEND_DIR, shell=IS_WINDOWS).returncode
         if rc != 0:
             fail("npm install failed.")
             return False
+        if not _frontend_deps_healthy(nm):
+            fail("npm install finished but dependencies are still incomplete. "
+                 "Delete frontend/node_modules and frontend/package-lock.json, "
+                 "then re-run: python runner.py")
+            return False
         ok("Frontend dependencies installed.")
     else:
-        ok("Frontend dependencies already installed.")
+        ok("Frontend dependencies installed and verified complete.")
     return True
 
 
 # ------------------------------------------------------------------ STEP 2
+ML_CORE_DEPS = ["fastapi>=0.115.0", "uvicorn[standard]>=0.32.0",
+                "pydantic>=2.10.0", "numpy>=1.26", "scikit-learn>=1.4"]
+
+
 def step2_service_deps(name: str, base: Path):
+    """Install service deps into its .venv.
+
+    The ML service is split in two tiers so it can ALWAYS start quickly:
+      core  (fast, ~30 MB): fastapi/uvicorn/numpy/scikit-learn  -> installed now
+      heavy (optional, GBs): torch/transformers/sentence-transformers/faiss
+                            -> installed in a BACKGROUND thread; until then the
+                               service runs with local heuristic/extractive models.
+    """
     banner(f"STEP 2 — Installing '{name}' Python dependencies")
     req = base / "requirements.txt"
     if not req.exists():
@@ -243,11 +345,40 @@ def step2_service_deps(name: str, base: Path):
     if not py.exists():
         info(f"Creating virtual environment at {base / '.venv'} ...")
         run([sys.executable, "-m", "venv", str(base / ".venv")])
+
+    if name == "ml_service":
+        core_stamp = base / ".venv" / ".core_installed"
+        if not core_stamp.exists():
+            info("pip installing CORE ML deps (fast — service starts immediately) ...")
+            rc = run([str(py), "-m", "pip", "install", "--quiet", *ML_CORE_DEPS]).returncode
+            if rc != 0:
+                fail("pip install failed for 'ml_service' core deps. Re-run runner.py.")
+                sys.exit(1)
+            core_stamp.touch()
+            ok("Core ML deps installed.")
+        else:
+            ok("'ml_service' core dependencies already installed.")
+        heavy_stamp = base / ".venv" / ".heavy_installed"
+        skipped = base / ".venv" / ".heavy_skipped"
+        if heavy_stamp.exists():
+            ok("'ml_service' heavy ML deps already installed.")
+        elif skipped.exists():
+            warn("Heavy ML deps were SKIPPED earlier (low disk space). Service "
+                 "runs fine on self-hosted pure-Python models. Free up ~5 GB, "
+                 "delete backend_ml/.venv/.heavy_skipped, re-run to upgrade.")
+        else:
+            info("Heavy ML deps (torch/transformers/faiss) will install in the "
+                 "BACKGROUND — the service is fully functional meanwhile.")
+            t = threading.Thread(target=_install_heavy_ml, args=(py, base, req),
+                                 daemon=True)
+            t.start()
+        return
+
     stamp = base / ".venv" / ".deps_installed"
     if stamp.exists() and stamp.stat().st_mtime >= req.stat().st_mtime:
         ok(f"'{name}' dependencies already installed.")
         return
-    info(f"pip installing {req.name} into .venv (first time may download a lot) ...")
+    info(f"pip installing {req.name} into .venv (be patient — first time may download a lot) ...")
     # Prebuilt wheels only — avoids pg_config / source-build failures on Windows.
     rc = run([str(py), "-m", "pip", "install", "--only-binary=:all:",
               "--upgrade", "pip"], check=False).returncode
@@ -257,6 +388,86 @@ def step2_service_deps(name: str, base: Path):
         sys.exit(1)
     stamp.touch()
     ok(f"'{name}' dependencies installed.")
+
+
+def _disk_free_gb(path: Path) -> float:
+    try:
+        return shutil.disk_usage(str(path)).free / (1024 ** 3)
+    except Exception:
+        return 999.0
+
+
+def _install_heavy_ml(py: Path, base: Path, req: Path):
+    """Background installer for OPTIONAL heavy ML packages (self-hosted only).
+
+    Guards learned from three incidents that used to leave ml_service looking
+    broken forever ("always STARTING, never RUNNING"):
+      * NEVER install inside the server process — this runs in a runner thread
+        while uvicorn is already UP and serving /api/ml/health.
+      * skip entirely if < 5 GB free disk (torch+transformers need ~3-4 GB);
+      * --no-cache-dir so pip doesn't double the footprint;
+      * Python-version-aware matrix: brand-new interpreters (e.g. 3.14) have
+        NO wheels for torch/faiss/sentence-transformers — plain `pip install
+        torch` fails with "No matching distribution found". We probe wheel
+        availability first and print an actionable hint instead of looping on
+        guaranteed-to-fail downloads;
+      * ALWAYS write a clear result line into .vj_logs/ml_heavy_install.log.
+    The service is fully functional WITHOUT these packages (deterministic
+    pure-Python self-hosted models); they only upgrade it to transformer
+    embeddings/generation later.
+    """
+    LOG_DIR.mkdir(exist_ok=True)
+    log = LOG_DIR / "ml_heavy_install.log"
+    with open(log, "a", encoding="utf-8") as fh:
+        def w(msg):
+            fh.write(msg + "\n"); fh.flush()
+
+        w(f"\n=== background heavy-ML install started {time.ctime()} ===")
+        free = _disk_free_gb(base)
+        if free < 5.0:
+            w(f"[SKIP] Only {free:.1f} GB free disk — heavy ML packages need "
+              "~5 GB. Service keeps running on self-hosted pure-Python models.")
+            w("[HINT] Free up disk space, then delete backend_ml/.venv/"
+              ".heavy_skipped and re-run runner.py.")
+            (base / ".venv" / ".heavy_skipped").touch()
+            return
+
+        # --- Python-version-aware package matrix -------------------------------
+        ver = subprocess.run([str(py), "-c",
+                              "import sys;print('%d.%d' % sys.version_info[:2])"],
+                             capture_output=True, text=True).stdout.strip() or "?"
+        try:
+            major, minor = (int(x) for x in ver.split("."))
+        except ValueError:
+            major, minor = 3, 12
+        if (major, minor) >= (3, 14):
+            w(f"[SKIP] Python {ver} has no published wheels yet for "
+              "torch/faiss-cpu/sentence-transformers — installing would fail "
+              "with 'No matching distribution found'.")
+            w("[HINT] The ML service is FULLY FUNCTIONAL right now on its "
+              "self-hosted pure-Python models. To enable the transformer "
+              "stack later, recreate the venv with Python 3.11–3.13:")
+            w('       py -3.12 -m venv backend_ml\\.venv && python runner.py')
+            (base / ".venv" / ".heavy_skipped").touch()
+            return
+
+        heavy = ["faiss-cpu>=1.8", "sentence-transformers>=3.0",
+                 "torch>=2.2", "transformers>=4.44"]
+        w(f"[INFO] Python {ver}, {free:.1f} GB free — installing "
+          "torch/transformers/faiss (several minutes; service stays UP) ...")
+        cmd = [str(py), "-m", "pip", "install", "--quiet", "--no-cache-dir", *heavy]
+        rc = subprocess.call(cmd, stdout=fh, stderr=subprocess.STDOUT)
+        if rc != 0:
+            w("[RETRY] first attempt failed — one automatic retry ...")
+            time.sleep(5)
+            rc = subprocess.call(cmd, stdout=fh, stderr=subprocess.STDOUT)
+        if rc == 0:
+            (base / ".venv" / ".heavy_installed").touch()
+            w("=== heavy ML deps installed OK — restart runner.py to enable "
+              "the transformer stack (health endpoint will show torch:true) ===")
+        else:
+            w("=== heavy ML install FAILED (service still runs on local "
+              "self-hosted fallback models — NOT an app-breaking error) ===")
 
 
 # ------------------------------------------------------------------ STEP 3
@@ -362,14 +573,90 @@ def precreate_tables():
     if not py.exists():
         return
     info("Ensuring database tables exist (Base.metadata.create_all) ...")
-    code = ("import asyncio, app.models, app.database as d;"
-            "asyncio.run(d.init_db()); print('tables ready')")
+    # NOTE: sys.exit(...) inside `python -c` raises SystemExit which asyncio
+    # wraps into a Task exception and dumps a 100-line traceback. We catch it
+    # explicitly so a missing/unreachable PostgreSQL prints ONE clean line
+    # instead of scaring the user with a stack trace.
+    code = (
+        "import asyncio, sys\n"
+        "try:\n"
+        "    import app.models, app.database as d\n"
+        "    async def _go():\n"
+        "        await d.init_db()\n"
+        "        await d.engine.dispose()\n"
+        "    asyncio.run(_go())\n"
+        "    print('tables ready')\n"
+        "except SystemExit:\n"
+        "    raise\n"
+        "except BaseException as e:\n"
+        "    print('DB-NOT-READY:', type(e).__name__, str(e).splitlines()[0][:200])\n"
+        "    sys.exit(3)\n"
+    )
     p = run([str(py), "-c", code], cwd=BACKEND_DIR, capture=True, check=False)
     if p.returncode == 0:
         ok("Tables created / verified.")
     else:
-        warn("Could not pre-create tables — backend will still start;"
-             " DB endpoints may fail until the schema exists.")
+        warn("Could not pre-create tables (PostgreSQL not reachable yet) — the"
+             " backend will still start; DB endpoints stay degraded until you"
+             " follow STEP 3 in README.md and re-run python runner.py.")
+
+
+# ------------------------------------------------------------------ watchdog
+def _restart_service(name: str):
+    """Restart one named service after a crash.
+
+    start_*() append the new Popen to PROCESSES themselves, so we must NOT
+    re-append here (that used to register the same child twice). Returns the
+    new Popen or None if the restart failed / never became ready.
+    """
+    try:
+        if name == "backend":
+            return start_backend()
+        if name == "frontend":
+            return start_frontend()
+        if name == "ml_service":
+            return start_ml()
+    except Exception as e:
+        warn(f"Auto-restart of {name} failed: {e}")
+        return None
+
+
+def monitor_loop(max_restarts_per_service: int = 5):
+    """Keep-alive supervisor: watches child processes, restarts crashes with
+    exponential backoff, exits only when everything is dead and unrecoverable.
+    """
+    counts = {"backend": 0, "frontend": 0, "ml_service": 0}
+    while True:
+        time.sleep(3)
+        for p in list(PROCESSES):
+            rc = p.poll()
+            if rc is None:
+                continue
+            n = getattr(p, "_vj_name", None)
+            if p in PROCESSES:
+                PROCESSES.remove(p)
+            if n and counts.get(n, 0) < max_restarts_per_service:
+                counts[n] += 1
+                wait_s = min(2 ** counts[n], 30)
+                warn(f"{n} exited (code {rc}) — auto-restarting in {wait_s}s "
+                     f"(attempt {counts[n]}/{max_restarts_per_service}). "
+                     f"See .vj_logs/{n}.log")
+                time.sleep(wait_s)
+                newp = _restart_service(n)
+                if newp is None or newp.poll() is not None:
+                    alive = [q for q in PROCESSES if q.poll() is None]
+                    fail(f"{n} could NOT be restarted ({len(alive)} services still alive).")
+            elif n:
+                fail(f"{n} crashed {max_restarts_per_service}x — giving up on it."
+                     f" Check .vj_logs/{n}.log")
+        if not PROCESSES:
+            break
+        if all(q.poll() is not None for q in PROCESSES):
+            # give the loop one more sweep to attempt restarts before quitting
+            if all(getattr(q, "_reported", False) for q in PROCESSES):
+                break
+            for q in PROCESSES:
+                q._reported = True
 
 
 def step3_postgres(do_install: bool):
@@ -395,7 +682,15 @@ def step3_postgres(do_install: bool):
 
 
 # ------------------------------------------------------------------ STEP 4
-def start_service(name: str, cmd, cwd: Path, port: int, env_extra=None, shell=False):
+def start_service(name: str, cmd, cwd: Path, port: int, env_extra=None, shell=False,
+                  ready_url: str | None = None):
+    """Launch a service and wait until it is GENUINELY READY.
+
+    A listening socket alone is not enough (uvicorn binds the port before the
+    app finishes importing — that made ml_service look 'STARTING forever' and
+    let half-dead servers pass as UP). We now poll an actual HTTP endpoint
+    when one is given, and also detect early process exit with log tails.
+    """
     banner(f"STEP 4 — Starting {name}")
     LOG_DIR.mkdir(exist_ok=True)
     log = LOG_DIR / f"{name}.log"
@@ -411,16 +706,31 @@ def start_service(name: str, cmd, cwd: Path, port: int, env_extra=None, shell=Fa
     if not IS_WINDOWS:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, **kwargs)
+    proc._vj_name = name          # used by monitor_loop to identify crashes
+    proc._vj_cmdline = display    # fallback identification
     PROCESSES.append(proc)
-    if wait_for_port(port, 90):
-        ok(f"{name} is UP on port {port}  →  http://localhost:{port}")
-        return proc
-    tail = ""
-    try:
-        tail = "".join(open(log, encoding="utf-8", errors="ignore").readlines()[-15:])
-    except Exception:
-        pass
-    warn(f"{name} did NOT come up on port {port}. Last log lines:\n{tail}")
+
+    def tail_lines(n=15):
+        try:
+            return "".join(open(log, encoding="utf-8", errors="ignore").readlines()[-n:])
+        except Exception:
+            return "(no log output yet)"
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        # Real readiness check: HTTP endpoint if provided, else just the port.
+        ready = http_ok(ready_url) if ready_url else port_open(port)
+        if ready:
+            ok(f"{name} is UP on port {port}"
+               + (f"  →  {ready_url}" if ready_url else f"  →  http://localhost:{port}"))
+            return proc
+        # Process died early? Report immediately instead of waiting 90 s.
+        if proc.poll() is not None:
+            warn(f"{name} EXITED early (code {proc.returncode}). Last log lines:\n{tail_lines()}")
+            return proc
+        time.sleep(0.5)
+
+    warn(f"{name} did NOT become ready within 90s. Last log lines:\n{tail_lines()}")
     return proc
 
 
@@ -428,15 +738,120 @@ def start_backend():
     py = venv_python(BACKEND_DIR)
     exe = str(py) if py.exists() else sys.executable
     kill_port(BACKEND_PORT)
-    start_service("backend",
+    return start_service("backend",
                   [exe, "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", str(BACKEND_PORT)],
-                  BACKEND_DIR, BACKEND_PORT)
+                  BACKEND_DIR, BACKEND_PORT,
+                  ready_url=f"http://127.0.0.1:{BACKEND_PORT}/api/health")
+
+
+def _fetch_page(url: str, timeout: float = 5.0):
+    """Return (status, body) for a URL; (0, '') on any failure."""
+    try:
+        from urllib.request import urlopen
+        with urlopen(url, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return 0, ""
+
+
+def _find_free_port(preferred: int) -> int:
+    """The configured port, or the next free one if something else owns it
+    (a stale server used to make Vite silently move to :3001 while the
+    runner kept probing :3000 — 'frontend never ready' false alarm)."""
+    for p in range(preferred, preferred + 20):
+        if not port_open(p):
+            return p
+    return preferred
 
 
 def start_frontend():
     """Windows-safe launch. Never passes quoted paths through cmd strings —
-    that produced: '\"C:\\Program Files\\nodejs\\npm.cmd\"' is not recognized."""
+    that produced: '\"C:\\Program Files\\nodejs\\npm.cmd\"' is not recognized.
+
+    Readiness here means MORE than an open port: we fetch '/' and verify the
+    HTML actually contains the #root mount node AND that /src/main.tsx plus
+    EVERY view module compile (HTTP 200). A Vite server that boots but serves
+    a page whose entry module has a syntax error would otherwise look fine
+    while the browser shows a blank white screen.
+
+    Also: OneDrive-synced project folders intermittently lock/rewrite files
+    under node_modules, which breaks Vite's dependency optimizer with random
+    MODULE_NOT_FOUND / EBUSY errors → blank page. We detect the folder on
+    Windows and route Vite's cache to %LOCALAPPDATA% to dodge it.
+    """
     kill_port(FRONTEND_PORT)
+    port = _find_free_port(FRONTEND_PORT)
+    if port != FRONTEND_PORT:
+        warn(f"Port {FRONTEND_PORT} is occupied by another program — using "
+             f"{port} instead so the frontend can still start.")
+    base_url = f"http://127.0.0.1:{port}"
+
+    modules_to_check = ["/src/main.tsx", "/src/App.tsx",
+                        "/src/views/LoginPage.tsx",
+                        "/src/views/OnboardingQuiz.tsx",
+                        "/src/views/Dashboard.tsx"]
+
+    def broken_module():
+        """Return (module, status, snippet) of the first module Vite fails to
+        transform, else None."""
+        for m in modules_to_check:
+            st, body = _fetch_page(base_url + m)
+            if st == 200:
+                continue
+            if st >= 500 or "Transform failed" in body or "[plugin" in body \
+                    or "Internal server error" in body:
+                return m, st, body[:400]
+        return None
+
+    def frontend_ready(proc) -> bool:
+        if proc is not None and proc.poll() is not None:
+            return False
+        status, html = _fetch_page(base_url + "/")
+        if '<div id="root"' not in html or "/src/main.tsx" not in html:
+            return False
+        return broken_module() is None
+
+    def wait_until_ready(proc, seconds: float = 30.0) -> bool:
+        """Vite can answer the port a beat before it serves valid HTML — poll."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if frontend_ready(proc):
+                return True
+            if proc is not None and proc.poll() is not None:
+                return False
+            time.sleep(0.5)
+        return False
+
+    def report_success(via: str):
+        global ACTUAL_FRONTEND_PORT
+        ACTUAL_FRONTEND_PORT = port
+        ok(f"Frontend verified via {via}: real HTML with #root + main.tsx + "
+           f"all views compile (NOT a blank page) → http://localhost:{port}")
+
+    # --- environment tweaks ----------------------------------------------------
+    fe_env = {}
+    path_l = str(FRONTEND_DIR).lower()
+    if IS_WINDOWS and ("onedrive" in path_l or "one drive" in path_l):
+        cache = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) \
+              / "vidyajyoti" / "vite-cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        fe_env["VITE_CACHE_DIR"] = str(cache)
+        warn("Project lives inside a OneDrive folder — moved Vite's dep cache "
+             f"to {cache} to avoid sync-lock corruption (blank-screen bug).")
+        warn("TIP: right-click the project folder in File Explorer → 'Always "
+             "keep on this device', or move it out of OneDrive for reliability.")
+
+    def diagnose_failure():
+        bad = broken_module()
+        if bad:
+            m, st, snip = bad
+            warn(f"Blank-screen cause found: {m} fails to compile "
+                 f"(HTTP {st}). Vite error:\n{snip}")
+        else:
+            _, html = _fetch_page(base_url + "/")
+            warn("Frontend port open but page incomplete "
+                 f"(first 200 chars: {html[:200]!r}). Check .vj_logs/frontend.log"
+                 " — usually corrupted node_modules: delete it and re-run runner.py.")
 
     # Preferred: run Vite directly with node — no .cmd shim involved at all.
     node = shutil.which("node") or shutil.which("node.exe") \
@@ -447,19 +862,33 @@ def start_frontend():
     if node and vite_js.exists():
         proc = start_service(
             "frontend",
-            [node, str(vite_js), "--host", "0.0.0.0", "--port", str(FRONTEND_PORT)],
-            FRONTEND_DIR, FRONTEND_PORT,
+            [node, str(vite_js), "--host", "0.0.0.0", "--port", str(port)],
+            FRONTEND_DIR, port, env_extra=fe_env or None,
         )
-        if proc and port_open(FRONTEND_PORT):
+        if wait_until_ready(proc):
+            report_success("direct node+vite.js")
             return proc
         # fall through to npm
-        PROCESSES.remove(proc) if proc in PROCESSES else None
+        diagnose_failure()
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        if proc in PROCESSES:
+            PROCESSES.remove(proc)
+        kill_port(port)
         warn("Direct Vite launch failed — retrying via npm ...")
 
     npm, _ = find_npm()
     if npm:
         # Absolute path, NO extra quotes, list form works for .cmd on Windows too.
-        start_service("frontend", [npm, "run", "dev"], FRONTEND_DIR, FRONTEND_PORT)
+        proc = start_service("frontend", [npm, "run", "dev"], FRONTEND_DIR, port,
+                             env_extra=fe_env or None)
+        if wait_until_ready(proc):
+            report_success("npm run dev")
+        else:
+            diagnose_failure()
+        return proc
     else:
         fail("Neither node nor npm available to start the frontend.")
 
@@ -468,28 +897,77 @@ def start_ml():
     py = venv_python(ML_DIR)
     exe = str(py) if py.exists() else sys.executable
     kill_port(ML_PORT)
-    start_service("ml_service",
-                  [exe, "-m", "uvicorn", "app_ml.main:app", "--host", "0.0.0.0", "--port", str(ML_PORT)],
-                  ML_DIR, ML_PORT)
+
+    # Pre-flight: import app_ml.main in a throwaway process BEFORE uvicorn
+    # starts. If there is any syntax/import error, we print the REAL traceback
+    # here instead of letting uvicorn sit at "Waiting for application startup"
+    # (which looked like 'ml_service stuck in STARTING forever').
+    check = subprocess.run([exe, "-c", "import app_ml.main"],
+                           cwd=str(ML_DIR), capture_output=True, text=True)
+    if check.returncode != 0:
+        warn("app_ml.main failed to import — showing the actual error:")
+        print((check.stderr or check.stdout)[-2500:])
+        warn("Attempting to start anyway; /api/ml/health may stay down until fixed.")
+
+    # Fast, deterministic startup: app_ml.main imports ONLY fastapi/stdlib —
+    # no pip installs and no heavy model imports happen inside the server
+    # process anymore (that was the 'stuck in STARTING forever' bug). Heavy
+    # deps install in a background thread by STEP 2; endpoints use local
+    # heuristic fallbacks until they land.
+    proc = start_service("ml_service",
+                         [exe, "-m", "uvicorn", "app_ml.main:app", "--host", "0.0.0.0",
+                          "--port", str(ML_PORT), "--timeout-graceful-shutdown", "3"],
+                         ML_DIR, ML_PORT,
+                         ready_url=f"http://127.0.0.1:{ML_PORT}/api/ml/health")
+    return proc
 
 
 # ------------------------------------------------------------------ dashboard
 def status_dashboard():
     banner("VidyaJyoti — STATUS DASHBOARD")
+    fe_url = f"http://localhost:{ACTUAL_FRONTEND_PORT}"
     rows = [("backend", BACKEND_PORT, "http://localhost:8000/api/health"),
-            ("frontend", FRONTEND_PORT, "http://localhost:3000"),
+            ("frontend", ACTUAL_FRONTEND_PORT, fe_url),
             ("ml_service", ML_PORT, "http://localhost:9000/api/ml/health")]
     for name, port, url in rows:
-        state = "RUNNING" if port_open(port) else "STOPPED"
-        print(f"  {name:<12} {state:<10} {url}")
-    print("\n  ➜ Frontend (open this!)  http://localhost:3000")
+        # Verify with a real HTTP request, not just an open socket —
+        # no more false "RUNNING" for servers that never finished starting.
+        state = "RUNNING" if http_ok(url.replace("localhost", "127.0.0.1")) else "STOPPED"
+        extra = ""
+        if name == "frontend" and state == "RUNNING":
+            _, html = _fetch_page(f"http://127.0.0.1:{port}/")
+            if '<div id="root"' not in html or "/src/main.tsx" not in html:
+                state = "BROKEN PAGE"
+                extra = "  (serving HTML without #root — check frontend.log)"
+            else:
+                for m in ("/src/main.tsx", "/src/App.tsx",
+                          "/src/views/LoginPage.tsx",
+                          "/src/views/OnboardingQuiz.tsx",
+                          "/src/views/Dashboard.tsx"):
+                    st_mod, body = _fetch_page(f"http://127.0.0.1:{port}{m}")
+                    if st_mod >= 500 or "Transform failed" in body or "[plugin" in body:
+                        state = "BROKEN PAGE"
+                        extra = f"  ({m} fails to compile — blank screen; see frontend.log / browser console F12)"
+                        break
+        print(f"  {name:<12} {state:<12} {url}{extra}")
+    print("\n  ➜ Frontend (open this!)  " + fe_url)
     print("  ➜ Backend API            http://localhost:8000/api/health")
     print("  ➜ Backend docs (Swagger) http://localhost:8000/docs")
     print("  ➜ Self-hosted ML service http://localhost:9000/api/ml/health")
+    heavy_log = LOG_DIR / "ml_heavy_install.log"
+    if heavy_log.exists():
+        try:
+            last = [l for l in heavy_log.read_text(
+                encoding="utf-8", errors="ignore").splitlines() if l.strip()][-1:]
+            if last and ("SKIP" in last[0] or "FAILED" in last[0]):
+                print("  ℹ Heavy ML stack (torch/faiss) optional — "
+                      "ML service runs on self-hosted pure-Python models now.")
+        except Exception:
+            pass
     print(f"\n  Logs folder : {LOG_DIR.name}/")
     print("  Press Ctrl+C to stop ALL services cleanly.\n")
     try:
-        webbrowser.open("http://localhost:3000")
+        webbrowser.open(fe_url)
     except Exception:
         pass
 
@@ -549,15 +1027,11 @@ def main():
 
     status_dashboard()
 
-    # Keep alive; report crashes.
-    while True:
-        time.sleep(3)
-        for p in list(PROCESSES):
-            if p.poll() is not None and getattr(p, "_reported", False) is False:
-                p._reported = True
-                fail("A service exited unexpectedly — check .vj_logs/")
-        if all(p.poll() is not None for p in PROCESSES) and PROCESSES:
-            break
+    # Keep alive; auto-restart crashes (ml_service "STARTING forever" /
+    # frontend dying after OneDrive corrupted node_modules used to leave the
+    # runner exiting with a dead dashboard — now it supervises instead).
+    monitor_loop()
+    fail("All services stopped. See logs in .vj_logs/ and re-run python runner.py.")
 
 
 if __name__ == "__main__":

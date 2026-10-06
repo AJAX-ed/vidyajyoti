@@ -1,6 +1,27 @@
-# Dependencies
-node_modules/
+# Python Virtual Environments and Cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Build artifacts
+# Node.js Dependencies and Build Artifacts
+node_modules/
 dist/
 build/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# IDE and Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated Files
+.DS_Store
+Thumbs.db

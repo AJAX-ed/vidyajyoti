@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { toast } from "sonner";
 import {
   BookOpen, Sunrise, Moon, Sun, Utensils, Brain, CalendarDays, ChevronLeft, ChevronRight,
-  School, Coffee, Bus, Dumbbell, Shower, Sparkles,
+  School, Coffee, Bus, Dumbbell, ShowerHead, Sparkles,
 } from "lucide-react";
 
 /* ================= Types ================= */
@@ -50,6 +50,55 @@ interface Answers {
   peakProductivity: "Morning" | "Afternoon" | "Evening" | "Night";
   studySessionMinutes: number;
   breakMinutes: number;
+}
+
+const BACKEND_URL_FALLBACK = "http://localhost:9000";
+
+/** Call the self-hosted ML schedule optimizer. NEVER blocks the UI: on any
+ *  error/timeout we keep the locally generated plan (which is already valid). */
+async function mlScheduleAdjust(plan: Slot[], a: Answers): Promise<Slot[]> {
+  try {
+    const url = (import.meta.env.VITE_ML_URL || BACKEND_URL_FALLBACK) + "/api/ml/schedule-adjust";
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4000);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        user_id: 1,
+        plan: plan.filter((s) => s.type !== "sleep").map((s) => ({ start: s.start, end: s.end, type: s.type, label: s.label })),
+        history: {},
+        session_minutes: a.studySessionMinutes,
+        break_minutes: a.breakMinutes,
+      }),
+    });
+    clearTimeout(timer);
+    if (!res.ok) return plan;
+    const data = await res.json();
+    const mlPlan: Slot[] = (data.plan || []).filter(
+      (s: any) => typeof s?.start === "number" && typeof s?.end === "number" && s.end > s.start &&
+                  typeof s.type === "string");
+    if (!mlPlan.length) return plan;
+    // Re-add sleep bookends and verify the ML output didn't lose study time.
+    const mlStudy = mlPlan.filter((s) => s.type === "study").reduce((n, s) => n + s.end - s.start, 0);
+    const localStudy = plan.filter((s) => s.type === "study").reduce((n, s) => n + s.end - s.start, 0);
+    if (mlStudy < localStudy) return plan; // local plan already better — keep it
+    return withSleepBookends(mlPlan, plan);
+  } catch {
+    return plan; // ML service offline — deterministic local plan stands
+  }
+}
+
+function withSleepBookends(inner: Slot[], reference: Slot[]): Slot[] {
+  const first = Math.min(...inner.map((s) => s.start));
+  const last = Math.max(...inner.map((s) => s.end));
+  const out: Slot[] = [];
+  if (first > 0) out.push({ start: 0, end: first, type: "sleep", label: "Sleep" });
+  out.push(...[...inner].sort((x, y) => x.start - y.start));
+  if (last < 1439) out.push({ start: last, end: 1439, type: "sleep", label: "Sleep" });
+  void reference;
+  return out;
 }
 
 /* Peak-productivity windows (minutes since midnight) */
@@ -282,7 +331,7 @@ const Pill = ({ active, onClick, children }: any) => (
 );
 
 const PRESET_TASKS = [
-  { label: "Brush & freshen up", minutes: 10, icon: Shower },
+  { label: "Brush & freshen up", minutes: 10, icon: ShowerHead },
   { label: "Exercise / yoga", minutes: 30, icon: Dumbbell },
   { label: "Meditation / prayer", minutes: 15, icon: Sparkles },
   { label: "Reading / revision", minutes: 20, icon: BookOpen },
