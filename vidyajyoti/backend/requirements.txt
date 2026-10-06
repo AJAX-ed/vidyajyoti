@@ -7,3 +7,4 @@ pydantic-settings>=2.6.0
 # Sync driver used ONLY by runner.py for DB bootstrap (prebuilt wheels, no pg_config needed)
 psycopg2-binary>=2.9.10
 greenlet>=3.0.0
+httpx>=0.27

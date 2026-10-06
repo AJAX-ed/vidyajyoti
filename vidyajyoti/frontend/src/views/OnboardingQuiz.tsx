@@ -52,35 +52,48 @@ interface Answers {
   breakMinutes: number;
 }
 
-const BACKEND_URL_FALLBACK = "http://localhost:9000";
+// The ML service runs on :9000. We ALWAYS route ML calls through the MAIN
+// backend (:8000 → /api/ml/* proxy) instead of hitting :9000 directly, so a
+// dead ML service can never surface as a raw {"detail":"Not Found"} from some
+// other server (e.g. Vite on :3000 or a stale process on :9000).
+const ML_ENDPOINTS = {
+  schedule: `${BACKEND_URL}/api/ml/schedule-adjust`,
+};
 
-/** Call the self-hosted ML schedule optimizer. NEVER blocks the UI: on any
- *  error/timeout we keep the locally generated plan (which is already valid). */
+/** Call the self-hosted ML schedule optimizer via the main backend.
+ *  NEVER blocks the UI: on any error/timeout we keep the locally generated
+ *  plan (which is already valid and personalized). */
 async function mlScheduleAdjust(plan: Slot[], a: Answers): Promise<Slot[]> {
   try {
-    const url = (import.meta.env.VITE_ML_URL || BACKEND_URL_FALLBACK) + "/api/ml/schedule-adjust";
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 4000);
-    const res = await fetch(url, {
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const res = await fetch(ML_ENDPOINTS.schedule, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: ctrl.signal,
       body: JSON.stringify({
         user_id: 1,
+        // Send minutes relative to THIS user's wake time so the ML service
+        // cannot mis-derive a "day start" from absolute clock values.
+        wake: t2m(a.wakeTime),
+        sleep: (() => { let s = t2m(a.sleepTime); if (s <= t2m(a.wakeTime)) s += 1440; return s; })(),
         plan: plan.filter((s) => s.type !== "sleep").map((s) => ({ start: s.start, end: s.end, type: s.type, label: s.label })),
         history: {},
+        peak_productivity: a.peakProductivity,
         session_minutes: a.studySessionMinutes,
         break_minutes: a.breakMinutes,
       }),
     });
     clearTimeout(timer);
-    if (!res.ok) return plan;
+    if (!res.ok) return plan; // ML offline → local plan stands (no white screen, no error toast)
+    const ct = res.headers.get("content-type") || "";
+    if (!ct.includes("json")) return plan; // guard against HTML/404 pages
     const data = await res.json();
-    const mlPlan: Slot[] = (data.plan || []).filter(
+    if (!data || !Array.isArray(data.plan)) return plan; // e.g. {"detail":"Not Found"}
+    const mlPlan: Slot[] = data.plan.filter(
       (s: any) => typeof s?.start === "number" && typeof s?.end === "number" && s.end > s.start &&
                   typeof s.type === "string");
     if (!mlPlan.length) return plan;
-    // Re-add sleep bookends and verify the ML output didn't lose study time.
     const mlStudy = mlPlan.filter((s) => s.type === "study").reduce((n, s) => n + s.end - s.start, 0);
     const localStudy = plan.filter((s) => s.type === "study").reduce((n, s) => n + s.end - s.start, 0);
     if (mlStudy < localStudy) return plan; // local plan already better — keep it
@@ -91,12 +104,29 @@ async function mlScheduleAdjust(plan: Slot[], a: Answers): Promise<Slot[]> {
 }
 
 function withSleepBookends(inner: Slot[], reference: Slot[]): Slot[] {
+  // ML plans use the same wrap-around canvas (minutes may exceed 1439 for a
+  // person who sleeps past midnight). Rebuild the sleep bookends from the
+  // REFERENCE plan's real wake/sleep boundaries instead of assuming 00:00.
+  const refSleep = reference.filter((s) => s.type === "sleep");
   const first = Math.min(...inner.map((s) => s.start));
   const last = Math.max(...inner.map((s) => s.end));
+  let wakeAt = first;
+  let sleepStart = last;
+  if (refSleep.length) {
+    // earliest sleep block that ends at/just before the day's first activity
+    const prev = refSleep.find((s) => s.end <= first + 1);
+    if (prev) wakeAt = prev.end;
+    const nxt = [...refSleep].sort((a, b) => a.start - b.start).find((s) => s.start >= last - 1);
+    if (nxt) sleepStart = nxt.start;
+  }
   const out: Slot[] = [];
-  if (first > 0) out.push({ start: 0, end: first, type: "sleep", label: "Sleep" });
-  out.push(...[...inner].sort((x, y) => x.start - y.start));
-  if (last < 1439) out.push({ start: last, end: 1439, type: "sleep", label: "Sleep" });
+  if (wakeAt > 0 && wakeAt > sleepStart - 1440) {
+    out.push({ start: Math.max(0, sleepStart - 1440), end: wakeAt, type: "sleep", label: "Sleep" });
+  }
+  out.push(...dayOrder(inner, first));
+  if (sleepStart < wakeAt + 1440) {
+    out.push({ start: sleepStart, end: Math.min(wakeAt + 1440, 2879), type: "sleep", label: "Sleep until tomorrow" });
+  }
   void reference;
   return out;
 }
@@ -113,6 +143,14 @@ function overlapsPeak(s: number, e: number, peak: [number, number]): boolean {
   return s < peak[1] && e > peak[0];
 }
 
+/** Chronological order across a wrap-around day canvas. Slots whose start is
+ *  before the day's first block actually belong to the NEXT calendar day
+ *  (e.g. wake 23:00 → dinner at 00:30 comes AFTER evening study, not before). */
+function dayOrder(slots: Slot[], dayStart: number): Slot[] {
+  const key = (s: number) => (((s - dayStart) % 1440) + 1440) % 1440;
+  return [...slots].sort((x, y) => key(x.start) - key(y.start));
+}
+
 function fillStudySessions(
   slots: Slot[], start: number, end: number,
   sessionMin: number, breakMin: number, counter: { n: number },
@@ -127,6 +165,12 @@ function fillStudySessions(
     return;
   }
   let cur = start;
+  // If even one session + trailing room doesn't fit, still cover the window
+  // with breaks/free time — never leave unaccounted gaps inside the day.
+  if (end - cur < sess) {
+    if (end - cur >= 5) slots.push({ start: cur, end, type: "break", label: "Free time" });
+    return;
+  }
   let guard = 0; // hard safety cap — impossible to hang
   while (end - cur >= sess && guard++ < 100) {
     counter.n += 1;
@@ -149,88 +193,113 @@ function fillStudySessions(
 }
 
 function generateDayPlan(a: Answers): Slot[] {
-  const rawWake = t2m(a.wakeTime);
-  // Wake/sleep sanity: sleep must be later the SAME day; if the user picked an
-  // earlier time (e.g. wake 06:00, sleep 22:30 stored as 05:00), roll it over.
-  let sleepRaw = t2m(a.sleepTime);
-  if (sleepRaw <= rawWake) sleepRaw += 1440; // next-day early morning
-  const DAY_CAP = 1439;
-  // If the rolled-over sleep exceeds midnight, shift BOTH wake and sleep back
-  // by the overflow so the plan fits inside a single 00:00–23:59 canvas while
-  // preserving its exact shape (relative durations).
-  const shift = Math.max(0, sleepRaw - DAY_CAP);
-  const wake = rawWake - shift;
-  const sleep = sleepRaw - shift;
+  /* ---- Personalized anchors: every timestamp comes from THIS user's answers.
+     Nothing in the plan is a hardcoded default unless the user left a field
+     blank. Times live on a 0–1439 clock and may cross midnight (night owls). */
+  const rawWake = t2m(a.wakeTime || "06:00");
+  let rawSleep = t2m(a.sleepTime || "22:00");
+  if (rawSleep <= rawWake) rawSleep += 1440;            // sleep later that night / next morning
+  const sleepHours = (rawSleep - rawWake) / 60;
+  if (sleepHours < 4 || sleepHours > 14) {              // implausible entry → keep 7–9 h
+    rawSleep = rawWake + (sleepHours < 4 ? 7.5 : 9) * 60;
+  }
+  // NO shifting of the user's clock times anymore (that was the "wakes at 4:29"
+  // bug). Instead we use a WRAP-AROUND canvas: minutes ≥ 1440 mean "next day"
+  // and are displayed modulo 1440 in chronological order.
+
+  const norm = (ts: string, fallback: number) => {
+    try { return isNaN(t2m(ts)) ? fallback : t2m(ts); } catch { return fallback; }
+  };
+
+  /* Canonicalize every clock time onto THIS person's day canvas [wake, wake+1440):
+     a wall time earlier than the wake minute belongs to the same waking day
+     (e.g. wake 10:00 → "08:00" means tonight 20:00; wake 01:57 → "00:30" means
+     01:30 after wake). Applied uniformly to routines, meals, school and
+     coaching so nothing can ever be scheduled before the user gets up. */
+  const onCanvas = (mins: number) => {
+    let m = mins;
+    while (m < rawWake) m += 1440;
+    while (m >= rawWake + 1440) m -= 1440;
+    return m;
+  };
 
   const fixed: Slot[] = [];
 
-  // Morning routine starting at wake time — capped so it NEVER swallows
-  // school/commute/study time (this was the "breakfast after school" bug).
-  let cursor = wake;
+  const isSchoolTrack = a.educationType === "School" ||
+    (a.educationType === "Coaching" && a.coachingSubtype === "Dummy");
+  /* Canonicalize each anchor against the RAW wake minute first — this keeps
+     the leave→back (and start→end) ORDER intact across midnight, e.g.
+     leave 23:00 → 1380, back 00:30 → 1470 (not 30 before 1380). */
+  const lv = onCanvas(norm(a.leaveHome, rawWake % 1440));
+  const bk = onCanvas(norm(a.backHome, rawWake % 1440));
+  const st = onCanvas(norm(a.coachingStart, rawWake % 1440));
+  const en = onCanvas(norm(a.coachingEnd, rawWake % 1440));
+  const leave = lv;
+  const back = bk > lv ? bk : lv + 30;   // nonsensical same-time entry → min duration
+  const cs = st;
+  const ce = en > st ? en : st + 30;
+  const schoolStart = isSchoolTrack ? leave
+    : (a.educationType === "Coaching" && a.coachingSubtype === "Residential") ? cs
+    : rawSleep; // Home School: no external anchor
+
+  // Morning routine starts exactly when THIS user wakes up — but NEVER runs
+  // into school/coaching: it squeezes between wake and the first hard anchor.
+  const routineLimit = Math.min(rawSleep, Math.max(schoolStart, rawWake));
+  let cursor = rawWake;
   for (const task of a.morningTasks) {
     const dur = Math.max(Number(task.minutes) || 10, 5);
-    const rStart = cursor;
-    const rEnd = Math.min(cursor + dur, sleep);
-    if (rEnd - rStart >= 5) fixed.push({ start: rStart, end: rEnd, type: "routine", label: task.label });
+    const rEnd = Math.min(cursor + dur, routineLimit);
+    if (rEnd - cursor >= 5) fixed.push({ start: cursor, end: rEnd, type: "routine", label: task.label });
     cursor = rEnd;
-    if (cursor >= sleep) break;
+    if (cursor >= routineLimit) break;
   }
 
-  // Meals — anchored inside the waking day, clamped between wake and sleep.
-  // If a meal collides with the routine chain, push it right after the routine.
-  // Breakfast additionally never lands after school/coaching starts.
-  const relTime = (ts: string) => { let m = t2m(ts); if (m < wake) m += 1440; return m - shift; };
-  const schoolStart =
-    a.educationType === "School" || (a.educationType === "Coaching" && a.coachingSubtype === "Dummy")
-      ? relTime(a.leaveHome)
-      : a.educationType === "Coaching" && a.coachingSubtype === "Residential"
-        ? relTime(a.coachingStart)
-        : sleep; // Home School: no anchor
+  // Meals — personalized durations & times, placed inside the waking window.
+  const mealDur = a.mealsPerDay >= 5 ? 20 : a.mealsPerDay <= 2 ? 30 : undefined;
   const addMeal = (label: string, rawMin: number, dur: number) => {
-    let m = rawMin;
-    if (m < wake || m >= sleep) m = Math.min(Math.max(m, wake), sleep - dur); // keep within waking day
-    m = Math.max(m, cursor); // never earlier than end of morning routine
-    if (label === "Breakfast") {
-      const latest = schoolStart - dur; // must finish before school/coaching starts
-      if (m > latest) m = Math.max(Math.min(latest, cursor), wake); // slide back, not forward
+    let m = onCanvas(rawMin);
+    if (m > rawSleep - dur) m -= 1440;                    // occurrence too late today
+    if (m < rawWake) m = rawWake;                          // truly no room → at wake
+    m = Math.max(m, cursor);                               // after morning routine
+    if (label === "Breakfast") {                           // must fit BETWEEN wake and school
+      const latest = schoolStart - dur;
+      if (m > latest) m = Math.max(latest, rawWake);       // slide back, never past school
     }
-    m = Math.min(m, sleep - dur);
-    m = Math.max(m, wake);
-    fixed.push({ start: m, end: m + dur, type: "meal", label });
+    m = Math.min(m, rawSleep - dur);
+    m = Math.max(m, rawWake);
+    if (m + dur > m) fixed.push({ start: m, end: m + dur, type: "meal", label });
   };
-  addMeal("Breakfast", relTime(a.breakfast), 20);
-  addMeal("Lunch", relTime(a.lunch), 30);
-  addMeal("Dinner", relTime(a.dinner), 30);
+  addMeal("Breakfast", norm(a.breakfast, rawWake % 1440), mealDur ?? 20);
+  addMeal("Lunch", norm(a.lunch, rawWake % 1440), mealDur ?? 30);
+  addMeal("Dinner", norm(a.dinner, rawWake % 1440), mealDur ?? 30);
 
-  // School / dummy school + commute
-  if (a.educationType === "School" || (a.educationType === "Coaching" && a.coachingSubtype === "Dummy")) {
-    const leave = relTime(a.leaveHome);
-    const back = Math.max(relTime(a.backHome), leave + 30);
+  // School / dummy coaching + commute — anchored to THIS user's times.
+  if (isSchoolTrack) {
     const comm = Math.max(Number(a.commuteMinutes) || 0, 0);
-    const travelOut = Math.max(leave - comm, wake);
+    const travelOut = Math.max(leave - comm, rawWake);
     if (leave > travelOut) fixed.push({ start: travelOut, end: leave, type: "travel", label: "Travel to school/coaching" });
-    if (Math.min(back, sleep) > leave) fixed.push({ start: leave, end: Math.min(back, sleep), type: "school", label: a.educationType === "School" ? "School" : "Dummy school" });
-    if (back + comm <= sleep && back > leave) fixed.push({ start: back, end: Math.min(back + comm, sleep), type: "travel", label: "Travel home" });
+    if (Math.min(back, rawSleep) > leave) fixed.push({ start: leave, end: Math.min(back, rawSleep), type: "school", label: a.educationType === "School" ? "School" : "Dummy school" });
+    if (back > leave && back + comm <= rawSleep) fixed.push({ start: back, end: back + comm, type: "travel", label: "Travel home" });
   }
   // Residential coaching
   if (a.educationType === "Coaching" && a.coachingSubtype === "Residential") {
-    const cs = relTime(a.coachingStart);
-    const ce = Math.max(relTime(a.coachingEnd), cs + 30);
-    if (Math.min(ce, sleep) > cs) fixed.push({ start: cs, end: Math.min(ce, sleep), type: "school", label: "Coaching" });
+    if (Math.min(ce, rawSleep) > cs) fixed.push({ start: cs, end: Math.min(ce, rawSleep), type: "school", label: "Coaching" });
   }
 
-  // Drop zero/negative-length artifacts and any block outside the waking day
-  const valid = fixed.filter((b) => b.end > b.start && b.start >= 0 && b.start < sleep);
-  valid.sort((x, y) => x.start - y.start);
+  // Drop zero/negative-length artifacts and blocks outside the waking window
+  const valid = fixed.filter((b) => b.end > b.start && b.start >= rawWake && b.start < rawSleep);
 
   // Resolve overlaps with priority clipping: immovable blocks (school/travel)
-  // win over meals, which win over the morning-routine chain. Each block keeps
-  // only the time slices not already claimed by a higher-priority block.
+  // win over meals, which win over the morning-routine chain.
   const rank: Record<SlotType, number> = {
     sleep: 0, school: 1, travel: 2, meal: 3, routine: 4, study: 5, break: 6,
   };
+  // Order by type priority, then chronologically on THIS person's canvas
+  // (a dummy-school "leave at 23:00, back at 00:30" pair must keep its order
+  // even though 00:30 < 23:00 on the raw wall clock).
+  const ckey = (m: number) => (((m - rawWake) % 1440) + 1440) % 1440;
   const ordered = [...valid].sort(
-    (x, y) => rank[x.type] - rank[y.type] || x.start - y.start
+    (x, y) => rank[x.type] - rank[y.type] || ckey(x.start) - ckey(y.start)
   );
 
   type IV = { s: number; e: number };
@@ -262,13 +331,13 @@ function generateDayPlan(a: Answers): Slot[] {
       merged.push({ ...b });
       claim(b.start, b.end);
     } else if (b.type === "meal") {
-      // find the nearest free window of the same length. Breakfast searches
-      // BACKWARD first (it must stay before school); other meals search forward.
+      // nearest free window of the same length. Breakfast searches BACKWARD
+      // first (it must stay before school); other meals search forward.
       const dur = b.end - b.start;
       let placed = false;
-      const limit = b.label === "Breakfast" ? Math.min(sleep, schoolStart) : sleep;
+      const limit = b.label === "Breakfast" ? Math.min(rawSleep, schoolStart) : rawSleep;
       const tryAt = (s: number) => {
-        if (s >= wake && s + dur <= limit && free(s, s + dur)) {
+        if (s >= rawWake && s + dur <= limit && free(s, s + dur)) {
           merged.push({ ...b, start: s, end: s + dur });
           claim(s, s + dur);
           placed = true;
@@ -277,7 +346,7 @@ function generateDayPlan(a: Answers): Slot[] {
         return false;
       };
       if (b.label === "Breakfast") {
-        for (let s = b.start; !placed && s - dur >= wake; s -= 5) tryAt(s);
+        for (let s = b.start; !placed && s - dur >= rawWake; s -= 5) tryAt(s);
       }
       for (let s = b.start; !placed && s + dur <= limit; s += 5) tryAt(s);
       // last resort: drop a meal only when literally nowhere fits
@@ -291,27 +360,35 @@ function generateDayPlan(a: Answers): Slot[] {
     }
     // school/travel fully overlapping another immovable block: drop silently
   }
-  merged.sort((x, y) => x.start - y.start);
 
-  // Walk from wake → sleep, filling gaps with study sessions
+  // Walk from wake → sleep, filling gaps with study sessions. All blocks are
+  // guaranteed to lie inside [rawWake, rawSleep] by the clamps above, so a
+  // simple chronological walk is exact (no wrap ambiguity left).
   const peak = PEAK_WINDOWS[a.peakProductivity] || PEAK_WINDOWS.Morning;
   const slots: Slot[] = [];
-  if (wake > 0) slots.push({ start: 0, end: wake, type: "sleep", label: "Sleep" });
   const counter = { n: 0 };
-  let cur = wake;
-  for (const block of merged) {
-    if (block.start < cur) continue; // fully overlapped — already handled by merge
+  let cur = rawWake;
+  for (const block of [...merged].sort((x, y) => x.start - y.start)) {
+    if (block.end <= cur) continue;              // fully overlapped — handled by merge
     if (block.start > cur) fillStudySessions(slots, cur, block.start, a.studySessionMinutes, a.breakMinutes, counter, peak);
     slots.push(block);
     cur = Math.max(cur, block.end);
   }
-  if (cur < sleep) fillStudySessions(slots, cur, sleep, a.studySessionMinutes, a.breakMinutes, counter, peak);
-  if (sleep < 1439) slots.push({ start: sleep, end: 1439, type: "sleep", label: "Sleep" });
-  // Safety net: clamp into [0, 1439], drop degenerate blocks, clip overlaps
-  const out = slots
-    .map((s) => ({ ...s, start: Math.max(0, s.start), end: Math.min(1439, s.end) }))
-    .filter((s) => s.end > s.start)
-    .sort((x, y) => x.start - y.start);
+  if (cur < rawSleep) fillStudySessions(slots, cur, rawSleep, a.studySessionMinutes, a.breakMinutes, counter, peak);
+
+  // Sleep bookends on the wrap-around canvas (displayed mod 1440, in order):
+  //   previous-day sleep  [rawSleep - 1440 , rawWake]   (only if wake ≠ 00:00)
+  //   next-day sleep      [rawSleep , rawWake + 1440]   (always)
+  if (rawWake > 0) slots.push({ start: rawSleep - 1440, end: rawWake, type: "sleep", label: "Sleep" });
+  slots.push({ start: rawSleep, end: rawWake + 1440, type: "sleep", label: "Sleep until tomorrow" });
+
+  // Chronological sort on the canvas starting at the earliest block (prev-day
+  // sleep when present, otherwise wake), then clip any residual overlap.
+  const dayStart = Math.min(...slots.map((s) => s.start));
+  const out = dayOrder(
+    slots.map((s) => ({ ...s })).filter((s) => s.end > s.start),
+    dayStart
+  );
   for (let i = 1; i < out.length; i++) {
     if (out[i].start < out[i - 1].end) out[i].start = out[i - 1].end;
   }
@@ -359,9 +436,13 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
   const next = async () => {
     if (step === 5) {
       const plan = generateDayPlan(a);
-      setDayPlan(plan);
+      // Personalization pass by the SELF-HOSTED ML optimizer (via backend
+      // proxy). Non-blocking: any failure keeps the local personalized plan.
+      let finalPlan = plan;
+      try { finalPlan = await mlScheduleAdjust(plan, a); } catch {}
+      setDayPlan(finalPlan);
       try {
-        localStorage.setItem("vj_day_plan", JSON.stringify(plan));
+        localStorage.setItem("vj_day_plan", JSON.stringify(finalPlan));
         localStorage.setItem("vj_onboarding_data", JSON.stringify(a));
       } catch {}
     }

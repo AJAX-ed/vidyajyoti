@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db
-from app.routers import health, exams, onboarding
+from app.routers import health, exams, onboarding, ml
 
 
 @asynccontextmanager
@@ -30,6 +30,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(exams.router)
 app.include_router(onboarding.router)
+app.include_router(ml.router)
 
 # Later modules (stubs reserved): battlegrounds.py, doubts.py, points.py
 

@@ -29,6 +29,12 @@ class ScheduleIn(BaseModel):
     history: dict[str, Any] = {}
     session_minutes: int = 50
     break_minutes: int = 10
+    # THIS user's real clock anchors (minutes since midnight; sleep may exceed
+    # 1439 when the person sleeps past midnight). The optimizer never invents
+    # a wake time — it uses these values verbatim.
+    wake: int | None = None
+    sleep: int | None = None
+    peak_productivity: str | None = None  # Morning | Afternoon | Evening | Night
 
 
 class DoubtIn(BaseModel):
@@ -80,8 +86,9 @@ async def schedule_adjust(req: ScheduleIn):
     result = adjust_schedule(
         req.plan, req.history,
         session_minutes=req.session_minutes, break_minutes=req.break_minutes,
+        wake=req.wake, sleep=req.sleep, peak_productivity=req.peak_productivity,
     )
-    return {"user_id": req.user_id, "model": "schedule-optimizer-v2", **result}
+    return {"user_id": req.user_id, "model": "schedule-optimizer-v3", **result}
 
 
 # ------------------------------------------------------------------ doubt

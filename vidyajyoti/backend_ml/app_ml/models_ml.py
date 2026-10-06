@@ -102,27 +102,59 @@ def m2t(minutes: int) -> str:
     return f"{mm // 60:02d}:{mm % 60:02d}"
 
 
+PEAK_WINDOWS = {
+    "Morning": (5 * 60, 12 * 60),
+    "Afternoon": (12 * 60, 17 * 60),
+    "Evening": (17 * 60, 22 * 60),
+    "Night": (20 * 60, 23 * 60 + 59),
+}
+
+
 def adjust_schedule(plan: list[dict[str, Any]], history: dict[str, Any],
-                    session_minutes: int = 50, break_minutes: int = 10) -> dict[str, Any]:
-    """Re-pack study sessions around immovable anchors so that the biggest
-    continuous free gaps are used first and long sessions land inside the
-    user's peak-productivity window (learned from history["by_hour"] scores
-    when present). Deterministic; no randomness anywhere.
+                    session_minutes: int = 50, break_minutes: int = 10,
+                    wake: int | None = None, sleep: int | None = None,
+                    peak_productivity: str | None = None) -> dict[str, Any]:
+    """Personalized re-pack of study sessions around THIS user's immovable
+    anchors. Hard rules (learned from production bugs):
+
+      * wake/sleep come from the CALLER (the app sends the user's actual clock
+        times; sleep may exceed 1439 for people who sleep past midnight).
+        We NEVER derive a day start from min(slot starts) — that produced the
+        'wakes at 4:29' bug. Fallback order: explicit wake → earliest non-sleep
+        slot → 06:00 default only if the plan is empty.
+      * school/travel/meals/routine blocks are preserved EXACTLY as given.
+      * study sessions fill free gaps; the longest continuous gap inside the
+        user's peak window gets the ⚡ label and priority packing.
+      * deterministic: identical input → identical output. No randomness.
     """
-    anchors = [s for s in plan if s.get("type") in
-               ("school", "travel", "meal", "sleep", "routine")]
-    wake = min((int(s.get("start", 0)) for s in plan if s.get("type") != "sleep"),
-               default=6 * 60)
-    sleep = max((int(s.get("end", 0)) for s in plan), default=22 * 60 + 30)
+    # ---- Resolve the user's real waking window --------------------------
+    non_sleep = [s for s in plan if s.get("type") != "sleep"]
+    if wake is None:
+        wake = min((int(s["start"]) for s in non_sleep), default=6 * 60)
+    wake = int(wake) % 1440
+    if sleep is None:
+        sleep = max((int(s["end"]) for s in non_sleep), default=wake + 16 * 60)
+    sleep = int(sleep)
+    if sleep <= wake:              # wrap-around day (e.g. sleep 01:00 after wake 23:00)
+        sleep += 1440
+    sleep = min(sleep, wake + 20 * 60)   # impossible >20h waking window → clamp
+
     sess = max(15, min(int(session_minutes or 50), 180))
     brk = max(5, min(int(break_minutes or 10), 30))
 
-    # Free intervals = waking day minus anchors.
-    busy = sorted((int(a["start"]), int(a["end"])) for a in anchors
-                  if int(a.get("end", 0)) > wake and int(a.get("start", 1440)) < sleep)
+    anchors = [s for s in non_sleep
+               if s.get("type") in ("school", "travel", "meal", "routine")]
+
+    def chron_key(start: int) -> int:
+        return ((int(start) - wake) % 1440 + 1440) % 1440
+
+    busy = sorted(((int(a["start"]), int(a["end"])) for a in anchors),
+                  key=lambda se: chron_key(se[0]))
     free: list[tuple[int, int]] = []
     cur = wake
     for s, e in busy:
+        if chron_key(s) >= 1440 - 1 and s < cur:   # belongs to previous day slice
+            continue
         if s > cur:
             free.append((cur, min(s, sleep)))
         cur = max(cur, e)
@@ -130,19 +162,23 @@ def adjust_schedule(plan: list[dict[str, Any]], history: dict[str, Any],
         free.append((cur, sleep))
     free = [(s, e) for s, e in free if e - s >= 20]
 
-    # Peak window from history if provided, else largest gap.
-    peak_start, peak_end = None, None
+    # ---- Peak window: explicit answer wins, then learned history --------
+    peak_start = peak_end = None
     by_hour = (history or {}).get("by_hour") or {}
-    if by_hour:
+    if peak_productivity and peak_productivity in PEAK_WINDOWS:
+        peak_start, peak_end = PEAK_WINDOWS[peak_productivity]
+    elif by_hour:
         best_h = max(by_hour, key=lambda h: float(by_hour[h]))
         peak_start, peak_end = int(best_h) * 60, int(best_h) * 60 + 60
     elif free:
         g = max(free, key=lambda se: se[1] - se[0])
         peak_start, peak_end = g
 
+    def in_peak(gs: int, ge: int) -> bool:
+        return peak_start is not None and gs < peak_end and ge > peak_start
+
     def pack(gap_s: int, gap_e: int, boost: bool) -> list[dict[str, Any]]:
-        slots, t = [], gap_s
-        n = 0
+        slots, t, n = [], gap_s, 0
         while gap_e - t >= sess:
             n += 1
             label = f"Study session {n}" + (" ⚡ peak focus" if boost else "")
@@ -156,27 +192,22 @@ def adjust_schedule(plan: list[dict[str, Any]], history: dict[str, Any],
         return slots
 
     new_slots: list[dict[str, Any]] = []
-    changed = 0
     for gs, ge in free:
-        in_peak = peak_start is not None and gs < peak_end and ge > peak_start
-        before = sum(1 for s in plan if s.get("type") == "study"
-                     and s.get("start") == gs)
-        packed = pack(gs, ge, boost=in_peak)
-        if not before:
-            changed += len(packed)
-        new_slots.extend(packed)
+        new_slots.extend(pack(gs, ge, boost=in_peak(gs, ge)))
 
     kept = [s for s in plan if s.get("type") != "study"]
-    merged = sorted(kept + new_slots, key=lambda s: int(s.get("start", 0)))
+    merged = sorted(kept + new_slots, key=lambda s: chron_key(int(s.get("start", 0))))
     total_study = sum(s["end"] - s["start"] for s in new_slots
                       if s.get("type") == "study")
     return {
         "plan": merged,
-        "changed_slots": changed,
+        "changed_slots": len(new_slots),
         "study_minutes": total_study,
         "sessions": sum(1 for s in new_slots if s.get("type") == "study"),
+        "wake": m2t(wake),
+        "sleep": m2t(sleep),
         "peak_window": [m2t(peak_start), m2t(peak_end)] if peak_start is not None else None,
-        "engine": "constraint-solver-v2",
+        "engine": "constraint-solver-v3-personalized",
     }
 
 
