@@ -1,0 +1,14 @@
+# VidyaJyoti ML service — CORE deps only (fast install, instant startup).
+# All self-hosted, open-source. NO external AI APIs are used or required.
+fastapi>=0.115,<0.120
+uvicorn[standard]>=0.32
+pydantic>=2.9
+numpy>=1.26
+scikit-learn>=1.4
+
+# OPTIONAL heavy transformer stack (torch/faiss/sentence-transformers/
+# transformers) is NOT listed here on purpose: it is multi-GB, has no wheels
+# for very new Python versions, and installing it at boot previously kept the
+# service "STARTING forever". runner.py installs it in a BACKGROUND thread
+# using a Python-version-aware matrix; endpoints run on local pure-Python
+# models until then. See README.md → "ML service tiers".
