@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
+from sqlalchemy import Column, Integer, String, Date, Text, DateTime, ForeignKey, func
 from sqlalchemy.dialects.postgresql import JSONB
 from app.database import Base
 
@@ -12,6 +12,26 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     onboarding_data = Column(JSONB, nullable=True)
     day_plan = Column(JSONB, nullable=True)
+    # Weekly/monthly syllabus goals computed by the self-hosted ML planner.
+    weekly_goals = Column(JSONB, nullable=True)
+    monthly_goals = Column(JSONB, nullable=True)
+
+
+class DailyPlan(Base):
+    """One generated timetable per user per calendar day.
+
+    This is what makes every day different: when a student logs in on a new
+    day, the backend asks the ML service for that date's rotation of the
+    stored weekly goals and persists the resulting plan here (keyed by
+    (user_id, plan_date))."""
+    __tablename__ = "daily_plans"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    plan_date = Column(Date, index=True)
+    slots = Column(JSONB, nullable=False, default=list)     # timeline blocks
+    focus_topics = Column(JSONB, nullable=True, default=list)  # topics today
+    week_index = Column(Integer, nullable=True)            # which goal week
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class Exam(Base):

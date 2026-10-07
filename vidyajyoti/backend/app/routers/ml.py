@@ -68,3 +68,15 @@ async def ml_health():
         return Response(
             content='{"status": "offline", "external_ai_apis": false}',
             status_code=503, media_type="application/json")
+
+
+@router.post("/plan-goals")
+async def plan_goals(payload: dict):
+    """Proxy the self-hosted weekly/monthly pacing planner."""
+    return await _proxy("/api/ml/plan-goals", payload)
+
+
+@router.post("/daily-plan")
+async def daily_plan(payload: dict):
+    """Proxy the per-day plan variation model (different timetable each day)."""
+    return await _proxy("/api/ml/daily-plan", payload)
