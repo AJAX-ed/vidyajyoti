@@ -113,3 +113,47 @@ async def answer_doubt(req: DoubtIn):
         "sources": sources,
         "model": "rag-tutor-v2 (local retrieval + local generation)",
     }
+
+
+# ------------------------------------------------------- goal planning ------
+class GoalsIn(BaseModel):
+    user_id: int = 1
+    grade: str = "11"
+    subjects: list[str] = ["Physics", "Chemistry", "Maths"]
+    exams: list[str] = []
+    daily_study_minutes: int = 180
+    today: str | None = None  # ISO date; defaults to server's current date
+
+
+@router.post("/plan-goals")
+async def plan_goals(req: GoalsIn):
+    """Self-hosted weekly/monthly pacing planner.
+
+    Computes a non-exhaustive syllabus pace that finishes by Dec 31 of the
+    current year, personalized to the student's daily study capacity."""
+    from app_ml.models_ml import build_goals
+    result = build_goals(req.model_dump())
+    return {"user_id": req.user_id, "model": "pacing-planner-v1", **result}
+
+
+# --------------------------------------------------------- daily variation --
+class DailyPlanIn(BaseModel):
+    user_id: int = 1
+    base_plan: list[dict[str, Any]] = []
+    focus_topics: list[dict[str, Any]] = []
+    date: str | None = None           # ISO date — the per-day entropy source
+    peak_productivity: str | None = None
+
+
+@router.post("/daily-plan")
+async def daily_plan(req: DailyPlanIn):
+    """Return TODAY's timetable: anchors preserved, study blocks re-labelled
+    with today's rotating topics and varied lengths/order (date-seeded, so
+    every calendar day is different but reproducible)."""
+    from datetime import date as _date
+    from app_ml.models_ml import vary_plan
+    seed = req.date or _date.today().isoformat()
+    result = vary_plan(req.base_plan, f"{req.user_id}:{seed}",
+                       req.focus_topics, req.peak_productivity)
+    return {"user_id": req.user_id, "date": seed,
+            "model": "daily-variation-v1", **result}

@@ -45,7 +45,8 @@ class OnboardingSaveRequest(BaseModel):
 class OnboardingSaveResponse(BaseModel):
     ok: bool
     user_id: int
-    slots_saved: int
+    slots_saved: int = 0
+    plan_status: str = "plan_generating"  # syllabus_pending | proposed | plan_generating
 
 
 class OnboardingGetResponse(BaseModel):

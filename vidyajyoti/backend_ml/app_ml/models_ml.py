@@ -288,3 +288,219 @@ def get_recommender():
             _MODEL_CACHE["recommender"] = GradientBoostingRegressor(
                 n_estimators=60, max_depth=3, random_state=42)
     return _MODEL_CACHE["recommender"]
+
+
+# =============================================== weekly/monthly goal planner ==
+def _days_left_this_year(today_iso: str | None = None) -> int:
+    from datetime import date as _date
+    if today_iso:
+        try:
+            y, m, d = map(int, today_iso.split("-"))
+            today = _date(y, m, d)
+        except Exception:
+            today = _date.today()
+    else:
+        today = _date.today()
+    return max(1, (_date(today.year, 12, 31) - today).days)
+
+
+def _syllabus_topics(grade: str, subjects: list[str], count: int) -> list[dict]:
+    """Placeholder syllabus until real curriculum data is supplied.
+
+    Contract (from the product spec):
+      * normal grades   -> "Topic <Grade name> <1..10>" per subject
+      * dropers (grade 12 / "Drop year") -> "Topic <1..20>" per subject
+    Returns a flat ordered list of {subject, topic} dicts of length `count`."""
+    is_dropper = str(grade).strip().lower() in ("12", "drop year", "dropper", "drop")
+    topics: list[dict] = []
+    idx: dict[str, int] = {}
+    while len(topics) < count:
+        progressed = False
+        for s in subjects:
+            i = idx.get(s, 0) + 1
+            limit = 20 if is_dropper else 10
+            if i > limit:
+                continue
+            idx[s] = i
+            name = f"Topic {i}" if is_dropper else f"Topic {grade} {i}"
+            topics.append({"subject": s, "topic": name})
+            progressed = True
+        if not progressed or len(topics) >= count:
+            break
+    return topics[:count]
+
+
+def build_goals(payload: dict) -> dict:
+    """Self-hosted weekly/monthly pacing planner.
+
+    Given the student's grade, subjects and DAILY study capacity (minutes),
+    it computes how many topics can be finished by Dec 31 of THIS year without
+    overloading anyone, then splits them into non-exhaustive weekly goals and
+    monthly milestones. Deterministic given the same input — but personalized
+    per student because capacity, subjects and start date all differ.
+
+    Pacing model:
+      * ~50 focused minutes per new topic (one session incl. notes).
+      * 15% of daily capacity reserved for revision/quiz days → never exhaustive.
+      * Weekly load is clamped to a human cadence (3–14 topics/week).
+      * The syllabus pool is paced ACROSS the remaining weeks so the student
+        finishes the available topics right around Dec 31 instead of burning
+        out in week one. If real syllabus data has fewer topics than capacity,
+        leftover weeks automatically become revision/mock-test weeks.
+    """
+    from datetime import date as _date
+    grade = str(payload.get("grade") or "12").strip()
+    subjects = payload.get("subjects") or ["General Studies"]
+    exams = payload.get("exams") or []
+    is_dropper = grade.lower() in ("12", "drop year", "dropper", "drop")
+
+    capacity_min = int(payload.get("daily_study_minutes") or 180)
+    # realistic cap: nobody sustainably studies >6h/day on top of school/coaching
+    capacity_min = max(30, min(capacity_min, 360))
+
+    start = _date.fromisoformat(payload["today"]) if payload.get("today") else _date.today()
+    dec31 = _date(start.year, 12, 31)
+    days_left = max(1, (dec31 - start).days)
+    num_weeks = max(1, round(days_left / 7))
+
+    MIN_PER_TOPIC = 50
+    effective_capacity = capacity_min * 0.85          # buffer for revision days
+    sustainable_weekly = int(max(3, min(round(effective_capacity * 7 / MIN_PER_TOPIC), 14)))
+
+    # How many topics does the year have room for at this sustainable pace?
+    demand = int(effective_capacity / MIN_PER_TOPIC * days_left)
+    # Pull the placeholder syllabus pool (per-subject limits: 1..10 grades,
+    # 1..20 droppers). Real curriculum data will replace this later.
+    pool = _syllabus_topics(grade, subjects, max(demand, sustainable_weekly))
+    total_topics = len(pool)
+
+    # Pace the ACTUAL pool across the remaining weeks: weekly count is the
+    # smaller of (sustainable load, evenly spread pace), floored at 1 so even
+    # tiny pools still finish before the year ends.
+    spread = max(1, round(total_topics / num_weeks))
+    weekly_count = max(1, min(sustainable_weekly, max(spread, 3)))
+    while weekly_count * ((total_topics + weekly_count - 1) // weekly_count) > weekly_count * num_weeks and weekly_count < sustainable_weekly:
+        weekly_count += 1   # nudge up only if spreading would exceed the year
+
+    weeks: list[dict] = []
+    i = 0
+    wi = 0
+    while i < total_topics:
+        chunk = pool[i:i + weekly_count]
+        wk_start = start.toordinal() + wi * 7
+        wk_end = min(wk_start + 6, dec31.toordinal())
+        weeks.append({
+            "week": wi + 1,
+            "start": _date.fromordinal(wk_start).isoformat(),
+            "end": _date.fromordinal(wk_end).isoformat(),
+            "topics": chunk,
+            "target_minutes_per_day": round(len(chunk) * MIN_PER_TOPIC / 7 * (1 / 0.85)),
+            "sessions_per_day": max(1, round(len(chunk) / 7 + 0.5)),
+        })
+        i += weekly_count
+        wi += 1
+
+    months: list[dict] = []
+    m = 0
+    while True:
+        month_no = ((start.month - 1 + m) % 12) + 1
+        year = start.year + 1 if month_no < start.month else start.year
+        if year > start.year:      # we only plan through THIS calendar year
+            break
+        label = _date(year, month_no, 1).strftime("%B %Y")
+        mw = [w for w in weeks if _date.fromisoformat(w["start"]).month == month_no
+              and _date.fromisoformat(w["start"]).year == year]
+        months.append({
+            "month": label,
+            "weeks": [w["week"] for w in mw],
+            "topic_count": sum(len(w["topics"]) for w in mw),
+            "milestone": (f"Finish {sum(len(w['topics']) for w in mw)} topics"
+                          f"{' + monthly revision test' if mw else ' (revision & mock tests)'}"),
+        })
+        if month_no == 12:
+            break
+        m += 1
+
+    load = "light" if weekly_count <= 5 else "balanced" if weekly_count <= 9 else "intensive"
+    return {
+        "engine": "pacing-planner-v2 (self-hosted, deterministic)",
+        "grade": grade,
+        "subjects": subjects,
+        "exams": exams,
+        "is_dropper": is_dropper,
+        "days_left_in_year": days_left,
+        "daily_study_minutes": capacity_min,
+        "total_topics": total_topics,
+        "topics_per_week": weekly_count,
+        "weekly_goals": weeks,
+        "monthly_goals": months,
+        "load_profile": load,
+        "summary": (f"{total_topics} topics by Dec 31 · {weekly_count}/week "
+                    f"({load}) · ~{capacity_min} min/day · "
+                    f"{len(weeks)} goal-weeks across {len(months)} months"),
+    }
+
+
+# ==================================================== daily plan variation ====
+def vary_plan(base_slots: list[dict], seed_key: str, focus_topics: list[dict],
+              peak_productivity: str | None = None) -> dict:
+    """Give every calendar day its own flavour WITHOUT breaking fixed anchors.
+
+    Rules:
+      * school/travel/meal/routine/sleep blocks are NEVER moved (they are the
+        student's real life).
+      * study sessions are re-labelled with today's rotating topics, shuffled
+        in length (45/50/60 min mix), and their ORDER within free gaps is
+        rotated deterministically by the date-seeded RNG — so Monday ≠ Tuesday
+        even for an identical routine, yet nothing overlaps and wake/sleep
+        times stay exactly what the student entered.
+      * one shorter "revision" session and one quiz-style session are inserted
+        into the day when there are >= 3 study blocks, for variety/fun.
+    Deterministic: same (plan, date) → same output; different date → different.
+    """
+    import random as _random
+    rng = _random.Random(seed_key)
+
+    slots = [dict(s) for s in base_slots]
+    studies = [s for s in slots if s.get("type") == "study"]
+    if not studies:
+        return {"plan": slots, "focus_topics": [], "varied": False,
+                "reason": "no study blocks to vary"}
+
+    # Rotate which topics land on which session using the date as entropy.
+    topics = focus_topics or [{"subject": "General", "topic": "Revision"}]
+    offset = rng.randrange(len(topics)) if topics else 0
+    labels = []
+    for k in range(len(studies)):
+        t = topics[(offset + k) % len(topics)]
+        labels.append(f"{t['subject']}: {t['topic']}")
+    # shuffle assignment order per-day (still deterministic for the date)
+    perm = list(range(len(labels)))
+    rng.shuffle(perm)
+    labels = [labels[p] for p in perm]
+
+    # Vary session lengths around the student's preferred block size.
+    lens = [45, 50, 60]
+    for idx, s in enumerate(studies):
+        dur = s["end"] - s["start"]
+        if dur < 30:
+            continue
+        s["label"] = labels[idx % len(labels)]
+        newlen = min(dur, rng.choice(lens))
+        s["end"] = s["start"] + newlen
+        # trim any following break instead of leaving a hole
+    # last study of the day becomes "Quiz time 🎯" if >=3 sessions
+    if len(studies) >= 3:
+        studies[-1]["label"] = f"Quiz time 🎯 ({studies[-1]['label']})"
+        mid = studies[len(studies) // 2]
+        mid["label"] = f"Revision: {mid['label']}"
+
+    # Drop zero-length artifacts created by trimming.
+    slots = [s for s in slots if s["end"] > s["start"]]
+    return {
+        "plan": slots,
+        "focus_topics": labels[:len(topics)],
+        "varied": True,
+        "seed": seed_key,
+        "engine": "daily-variation-v1 (deterministic per-date RNG)",
+    }

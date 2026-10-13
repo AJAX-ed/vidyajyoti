@@ -1,11 +1,43 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import {
   GraduationCap, Moon, Sun, LogOut, Coins, Flame, Star, LayoutDashboard, Swords,
   HelpCircle, Trophy, BookOpen, CalendarDays, Target, BarChart3, Users, Settings,
   Bell, Library, Wallet, Coffee, Utensils, School, Sunrise, Bus, ChevronRight,
 } from "lucide-react";
-import type { Slot, SlotType } from "./OnboardingQuiz";
+import type { Slot, SlotType, WeeklyGoal, MonthlyGoal, TopicGoal } from "./OnboardingQuiz";
+
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+
+function todayISO(): string { return new Date().toISOString().slice(0, 10); }
+
+/* Local fallback daily variation — mirrors the ML service's
+   daily-variation-v1 so a new day still looks fresh even fully offline. */
+function localVary(base: Slot[], seed: string, focus: TopicGoal[]): Slot[] {
+  let h = 2166136261;
+  for (const c of seed) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); }
+  const rnd = () => { h = Math.imul(h ^ (h >>> 15), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); return ((h ^= h >>> 16) >>> 0) / 4294967296; };
+  const topics = focus.length ? focus : [{ subject: "Revision", topic: "Weekly recap" }];
+  const studies = base.filter((s) => s.type === "study");
+  if (!studies.length) return base;
+  const offset = Math.floor(rnd() * topics.length);
+  const labels = studies.map((_, k) => { const t = topics[(offset + k) % topics.length]; return `${t.subject}: ${t.topic}`; });
+  const out = base.map((s) => ({ ...s }));
+  let si = 0;
+  for (const s of out) {
+    if (s.type !== "study") continue;
+    const dur = s.end - s.start;
+    s.label = labels[si % labels.length];
+    if (dur >= 30) s.end = s.start + Math.min(dur, [45, 50, 60][Math.floor(rnd() * 3)]);
+    si++;
+  }
+  if (si >= 3) {
+    const idx = out.map((s, i) => s.type === "study" ? i : -1).filter((i) => i >= 0);
+    out[idx[idx.length - 1]].label = `Quiz time 🎯 (${out[idx[idx.length - 1]].label})`;
+    out[idx[Math.floor(idx.length / 2)]].label = `Revision: ${out[idx[Math.floor(idx.length / 2)]].label}`;
+  }
+  return out.filter((s) => s.end > s.start);
+}
 
 /* ---------- Theme (kept local so views stay independent) ---------- */
 function useThemeLocal() {
@@ -52,9 +84,60 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
   const { theme, toggleTheme } = useThemeLocal();
   const [view, setView] = useState("dashboard");
   const userName = localStorage.getItem("vj_user_name") || "Student";
+  const [plan, setPlan] = useState<Slot[]>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem("vj_day_plan") || "[]") as Slot[];
+      // Stale plan from an earlier day? Re-vary it locally right now so the
+      // student sees a fresh timetable the moment the date rolls over —
+      // then the backend/ML refresh below upgrades it with real goals.
+      const savedDate = localStorage.getItem("vj_plan_date") || "";
+      if (savedDate !== todayISO() && stored.length) {
+        let focus: TopicGoal[] = [];
+        try {
+          const wk = JSON.parse(localStorage.getItem("vj_weekly_goals") || "[]") as WeeklyGoal[];
+          focus = wk.length ? wk[0].topics.slice(0, 4) : [];
+        } catch {}
+        return localVary(stored, `1:${todayISO()}`, focus);
+      }
+      return stored;
+    } catch { return []; }
+  });
+  const [weeklyGoals] = useState<WeeklyGoal[]>(() => { try { return JSON.parse(localStorage.getItem("vj_weekly_goals") || "[]"); } catch { return []; } });
+  const [monthlyGoals] = useState<MonthlyGoal[]>(() => { try { return JSON.parse(localStorage.getItem("vj_monthly_goals") || "[]"); } catch { return []; } });
+  const [goalsSummary] = useState<string>(() => localStorage.getItem("vj_goals_summary") || "");
+  const [dayGenerated, setDayGenerated] = useState(false);
 
-  let plan: Slot[] = [];
-  try { plan = JSON.parse(localStorage.getItem("vj_day_plan") || "[]"); } catch {}
+  /* NEW-DAY LOGIN: ask the backend for today's personalized timetable.
+     The self-hosted ML service rotates topics + varies session lengths/order
+     per calendar date; anchors (wake/school/meals) never move. Falls back to
+     the locally varied plan when the backend is offline. */
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 6000);
+        const res = await fetch(`${BACKEND_URL}/api/onboarding/1/today`, { signal: ctrl.signal });
+        clearTimeout(timer);
+        if (!res.ok || !alive) return;
+        const ct = res.headers.get("content-type") || "";
+        if (!ct.includes("json")) return;
+        const d = await res.json();
+        if (!Array.isArray(d.plan) || !d.plan.length) return;
+        setPlan(d.plan);
+        if (Array.isArray(d.weekly_goals) && d.weekly_goals.length) {
+          localStorage.setItem("vj_weekly_goals", JSON.stringify(d.weekly_goals));
+        }
+        if (Array.isArray(d.monthly_goals) && d.monthly_goals.length) {
+          localStorage.setItem("vj_monthly_goals", JSON.stringify(d.monthly_goals));
+        }
+        localStorage.setItem("vj_day_plan", JSON.stringify(d.plan));
+        localStorage.setItem("vj_plan_date", d.date || todayISO());
+        setDayGenerated(!!d.generated);
+      } catch { /* backend offline → local varied plan stands */ }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   const studyMinutes = plan.filter((s) => s.type === "study").reduce((n, s) => n + (s.end - s.start), 0);
   const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
@@ -113,6 +196,9 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                   <span className="bg-white/15 rounded-lg px-3 py-1.5">
                     Now: {currentSlot ? currentSlot.label : plan.length === 0 ? "Complete onboarding to see your plan" : "Free time"}
                   </span>
+                  {dayGenerated && (
+                    <span className="bg-white/25 rounded-lg px-3 py-1.5 font-semibold">✨ New timetable generated for today!</span>
+                  )}
                 </div>
               </div>
 
@@ -131,9 +217,38 @@ export default function Dashboard({ onLogout }: { onLogout: () => void }) {
                 ))}
               </div>
 
+              {/* Weekly & monthly syllabus goals (ML pacing planner) */}
+              {(weeklyGoals.length > 0 || monthlyGoals.length > 0) && (
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div className="bg-surface border border-app rounded-2xl p-5">
+                    <h2 className="font-bold mb-1 flex items-center gap-2"><Target size={16} className="text-[var(--primary)]" /> This Week's Goal</h2>
+                    {goalsSummary && <p className="text-xs text-muted mb-3">{goalsSummary}</p>}
+                    <div className="flex flex-wrap gap-2">
+                      {(weeklyGoals[0]?.topics || []).map((t, i) => (
+                        <span key={i} className="px-3 py-1 rounded-full text-xs gradient-emerald text-white">{t.subject}: {t.topic}</span>
+                      ))}
+                    </div>
+                    {weeklyGoals.length > 1 && (
+                      <p className="text-xs text-muted mt-3">Weeks 2–{weeklyGoals.length} queued — paced to finish by Dec 31 without burning you out.</p>
+                    )}
+                  </div>
+                  <div className="bg-surface border border-app rounded-2xl p-5">
+                    <h2 className="font-bold mb-3 flex items-center gap-2"><CalendarDays size={16} className="text-[var(--primary)]" /> Monthly Milestones</h2>
+                    <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
+                      {monthlyGoals.map((m, i) => (
+                        <div key={i} className="flex items-center justify-between text-sm p-2 rounded-lg bg-[var(--bg)] border border-app">
+                          <span className="font-medium">{m.month}</span>
+                          <span className="text-xs text-muted">{m.milestone}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Today's plan */}
               <div className="bg-surface border border-app rounded-2xl p-5">
-                <h2 className="font-bold mb-4">Today's Plan</h2>
+                <h2 className="font-bold mb-4">Today's Plan <span className="text-xs font-normal text-muted">(regenerated fresh every day)</span></h2>
                 {plan.length === 0 ? (
                   <p className="text-muted text-sm">No plan yet — redo onboarding to generate one.</p>
                 ) : (

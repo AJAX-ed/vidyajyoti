@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { toast } from "sonner";
 import {
   BookOpen, Sunrise, Moon, Sun, Utensils, Brain, CalendarDays, ChevronLeft, ChevronRight,
-  School, Coffee, Bus, Dumbbell, ShowerHead, Sparkles,
+  School, Coffee, Bus, Dumbbell, ShowerHead, Sparkles, Target,
 } from "lucide-react";
 
 /* ================= Types ================= */
@@ -58,7 +58,64 @@ interface Answers {
 // other server (e.g. Vite on :3000 or a stale process on :9000).
 const ML_ENDPOINTS = {
   schedule: `${BACKEND_URL}/api/ml/schedule-adjust`,
+  goals: `${BACKEND_URL}/api/ml/plan-goals`,
+  daily: `${BACKEND_URL}/api/ml/daily-plan`,
 };
+
+export interface TopicGoal { subject: string; topic: string }
+export interface WeeklyGoal {
+  week: number; start: string; end: string; topics: TopicGoal[];
+  target_minutes_per_day: number; sessions_per_day: number;
+}
+export interface MonthlyGoal { month: string; weeks: number[]; topic_count: number; milestone: string }
+
+/* Subjects derived from exam targets — mirrors the backend mapping. Real
+   syllabus data will replace this later (per product spec). */
+function subjectsFromAnswers(a: Answers): string[] {
+  const ex = a.exams.map((e) => e.toLowerCase());
+  if (ex.some((e) => e.includes("jee"))) return ["Physics", "Chemistry", "Maths"];
+  if (ex.some((e) => e.includes("neet"))) return ["Physics", "Chemistry", "Biology"];
+  if (ex.some((e) => e.includes("ssc"))) return ["Quantitative Aptitude", "Reasoning", "English", "General Awareness"];
+  if (a.grade) return [`Subject ${a.grade}`];
+  return ["General Studies"];
+}
+
+async function mlPlanGoals(a: Answers, studyMinutesPerDay: number): Promise<{ weekly: WeeklyGoal[]; monthly: MonthlyGoal[]; summary: string } | null> {
+  try {
+    const res = await fetch(ML_ENDPOINTS.goals, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: 1, grade: a.grade, subjects: subjectsFromAnswers(a),
+        exams: a.exams, daily_study_minutes: studyMinutesPerDay,
+        today: new Date().toISOString().slice(0, 10),
+      }),
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (!Array.isArray(d.weekly_goals) || !d.weekly_goals.length) return null;
+    return { weekly: d.weekly_goals, monthly: d.monthly_goals || [], summary: d.summary || "" };
+  } catch { return null; }
+}
+
+/** Ask the self-hosted ML service for TODAY's flavour of the plan: same
+ *  anchors, rotating topics, varied session lengths/order per calendar date. */
+async function mlDailyVariation(base: Slot[], a: Answers, focus: TopicGoal[]): Promise<Slot[]> {
+  try {
+    const res = await fetch(ML_ENDPOINTS.daily, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: 1, base_plan: base, focus_topics: focus,
+        date: new Date().toISOString().slice(0, 10),
+        peak_productivity: a.peakProductivity,
+      }),
+    });
+    if (!res.ok) return base;
+    const d = await res.json();
+    if (!Array.isArray(d.plan)) return base;
+    const out = d.plan.filter((s: any) => typeof s?.start === "number" && typeof s?.end === "number" && s.end > s.start);
+    return out.length ? out : base;
+  } catch { return base; }
+}
 
 /** Call the self-hosted ML schedule optimizer via the main backend.
  *  NEVER blocks the UI: on any error/timeout we keep the locally generated
@@ -419,6 +476,8 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
   const { theme, toggleTheme } = useThemeLocal();
   const [step, setStep] = useState(0);
   const [dayPlan, setDayPlan] = useState<Slot[]>([]);
+  const [goals, setGoals] = useState<{ weekly: WeeklyGoal[]; monthly: MonthlyGoal[]; summary: string } | null>(null);
+  const [focusToday, setFocusToday] = useState<TopicGoal[]>([]);
   const [saving, setSaving] = useState(false);
 
   const [a, setA] = useState<Answers>({
@@ -434,28 +493,47 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
   const [customMin, setCustomMin] = useState("20");
 
   const next = async () => {
-    if (step === 5) {
+    if (step === 4) {
+      // Build the BASE routine skeleton once (anchors + generic study blocks).
       const plan = generateDayPlan(a);
-      // Personalization pass by the SELF-HOSTED ML optimizer (via backend
-      // proxy). Non-blocking: any failure keeps the local personalized plan.
       let finalPlan = plan;
       try { finalPlan = await mlScheduleAdjust(plan, a); } catch {}
       setDayPlan(finalPlan);
+      // Weekly/monthly syllabus goals via the self-hosted pacing planner.
+      const studyMin = finalPlan.filter((s) => s.type === "study").reduce((n, s) => n + s.end - s.start, 0);
+      const g = await mlPlanGoals(a, Math.max(studyMin, 60));
+      setGoals(g);
+      const wk = g?.weekly || [];
+      const focus = wk.length ? wk[0].topics.slice(0, 4) : [];
+      setFocusToday(focus);
+      // Today's personalised timetable (varied per calendar date).
+      const todays = await mlDailyVariation(finalPlan, a, focus);
+      setDayPlan(todays);
       try {
-        localStorage.setItem("vj_day_plan", JSON.stringify(finalPlan));
+        localStorage.setItem("vj_base_plan", JSON.stringify(finalPlan));
+        localStorage.setItem("vj_day_plan", JSON.stringify(todays));
         localStorage.setItem("vj_onboarding_data", JSON.stringify(a));
+        localStorage.setItem("vj_weekly_goals", JSON.stringify(wk));
+        localStorage.setItem("vj_monthly_goals", JSON.stringify(g?.monthly || []));
+        localStorage.setItem("vj_goals_summary", g?.summary || "");
+        localStorage.setItem("vj_plan_date", new Date().toISOString().slice(0, 10));
       } catch {}
     }
-    if (step < 6) setStep(step + 1);
+    if (step < 7) setStep(step + 1);
   };
 
   const finish = async () => {
     setSaving(true);
     try {
+      let basePlan: Slot[] = dayPlan;
+      try { basePlan = JSON.parse(localStorage.getItem("vj_base_plan") || "[]"); } catch {}
       await fetch(`${BACKEND_URL}/api/onboarding/save`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: 1, data: a, plan: dayPlan }),
+        // Backend stores the BASE routine + computes/stores weekly+monthly goals
+        // via the self-hosted pacing planner, then serves a NEW varied plan
+        // each day on login (GET /api/onboarding/{id}/today).
+        body: JSON.stringify({ user_id: 1, data: a, plan: basePlan.length ? basePlan : dayPlan }),
       });
       toast.success("Day plan saved! (backend offline is OK — stored locally)");
     } catch {
@@ -478,11 +556,11 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
       <div className="w-full max-w-2xl bg-surface border border-app rounded-2xl p-6 md:p-8 shadow-xl">
         {/* Progress */}
         <div className="flex items-center gap-2 mb-6">
-          {Array.from({ length: 7 }).map((_, i) => (
+          {Array.from({ length: 8 }).map((_, i) => (
             <div key={i} className={`h-1.5 flex-1 rounded-full ${i <= step ? "gradient-emerald" : "bg-[var(--border)]"}`} />
           ))}
         </div>
-        <p className="text-muted text-xs mb-1">Step {step + 1} of 7</p>
+        <p className="text-muted text-xs mb-1">Step {step + 1} of 8</p>
 
         <AnimatePresence mode="wait">
           <motion.div
@@ -581,8 +659,8 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
               </Step>
             )}
 
-            {/* STEP 5 — study preferences */}
-            {step === 5 && (
+            {/* STEP 6 — study preferences */}
+            {step === 6 && (
               <Step title="Study preferences" icon={<Brain size={20} />}>
                 <p className="text-muted text-sm mb-2">Peak productivity time</p>
                 <div className="flex flex-wrap gap-2 mb-4">
@@ -597,20 +675,67 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
               </Step>
             )}
 
-            {/* STEP 6 — generated plan */}
-            {step === 6 && (
-              <Step title="Your day plan ✨" icon={<Coffee size={20} />}>
-                <div className="flex gap-3 mb-4 text-xs">
+            {/* STEP 5 — weekly & monthly syllabus goals (ML pacing planner) */}
+            {step === 5 && (
+              <Step title="Your weekly & monthly goals 🎯" icon={<Target size={20} />}>
+                <p className="text-muted text-sm mb-3">
+                  {goals?.summary || "Goal engine offline — we’ll compute your pace when you log in next."}
+                </p>
+                {!goals && (
+                  <p className="text-xs text-muted mb-3">
+                    Don’t worry — goals are also saved on the backend and shown on your Dashboard once the ML service is up.
+                  </p>
+                )}
+                {goals && (
+                  <>
+                    <p className="font-semibold text-sm mb-2">This week (Week 1)</p>
+                    <div className="flex flex-wrap gap-2 mb-4">
+                      {goals.weekly[0]?.topics.map((t, i) => (
+                        <span key={i} className="px-3 py-1 rounded-full text-xs gradient-emerald text-white">
+                          {t.subject}: {t.topic}
+                        </span>
+                      ))}
+                    </div>
+                    <p className="font-semibold text-sm mb-2">Monthly milestones</p>
+                    <div className="space-y-2 max-h-56 overflow-y-auto pr-2">
+                      {goals.monthly.map((m, i) => (
+                        <div key={i} className="flex items-center gap-3 p-2 rounded-lg bg-[var(--bg)] border border-app text-sm">
+                          <CalendarDays size={15} className="text-[var(--primary)] shrink-0" />
+                          <div>
+                            <div className="font-medium">{m.month}</div>
+                            <div className="text-xs text-muted">{m.milestone}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-xs text-muted mt-3">
+                      Paced to finish by Dec 31 without burning you out — the ML planner left slack for revision & quiz days.
+                    </p>
+                  </>
+                )}
+              </Step>
+            )}
+
+            {/* STEP 7 — today's personalized timetable */}
+            {step === 7 && (
+              <Step title={`Today’s plan ✨ (${new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "short" })})`} icon={<Coffee size={20} />}>
+                <div className="flex gap-3 mb-3 text-xs flex-wrap">
                   <span className="px-3 py-1 rounded-full bg-surface border border-app">{nSessions} study sessions</span>
                   <span className="px-3 py-1 rounded-full bg-surface border border-app">{studyH}h {studyM}m study/day</span>
                   <span className="px-3 py-1 rounded-full bg-surface border border-app">{dayPlan.length} blocks</span>
                 </div>
+                {focusToday.length > 0 && (
+                  <p className="text-xs text-muted mb-3">
+                    Today’s focus rotates through: {focusToday.map((t) => `${t.subject} · ${t.topic}`).join(", ")}.
+                    Tomorrow the ML service shuffles topics, lengths & order — a fresh timetable every day.
+                  </p>
+                )}
                 <div className="max-h-80 overflow-y-auto pr-2 space-y-1">
                   {dayPlan.map((s, i) => (
                     <div key={i} className="flex items-center gap-3 p-2 rounded-lg bg-[var(--bg)] border border-app text-sm">
                       <span className="font-mono text-xs text-muted w-24">{m2t(s.start)}–{m2t(s.end)}</span>
                       <TypeIcon type={s.type} />
-                      <span className="capitalize">{s.label}</span>
+                      <span>{s.label}</span>
                     </div>
                   ))}
                 </div>
@@ -625,7 +750,7 @@ export default function OnboardingQuiz({ onComplete }: { onComplete: () => void 
             className="flex items-center gap-1 px-4 py-2 rounded-lg border border-app text-muted disabled:opacity-30">
             <ChevronLeft size={16} /> Back
           </button>
-          {step < 6 ? (
+          {step < 7 ? (
             <button onClick={next} className="flex items-center gap-1 px-5 py-2 rounded-lg gradient-emerald text-white font-semibold">
               Next <ChevronRight size={16} />
             </button>
