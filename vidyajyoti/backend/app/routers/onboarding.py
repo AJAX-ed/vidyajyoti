@@ -54,53 +54,41 @@ async def save_onboarding(req: OnboardingSaveRequest, db: AsyncSession = Depends
         # auto-create demo user so the flow works out of the box
         user = User(id=req.user_id, name="Student", role="student")
         db.add(user)
+    # Preserve ALL onboarding fields (wake/sleep/school/meals/prefs are kept as
+    # availability & wellbeing inputs for the goal planner — NOT as a timetable).
     user.onboarding_data = req.data
-    user.day_plan = [slot.model_dump() for slot in req.plan]
 
-    # ---- Self-hosted ML: weekly/monthly goals (not exhaustive; year-end pace)
-    plan_slots = [s.model_dump() for s in req.plan]
-    study_min = sum(s["end"] - s["start"] for s in plan_slots if s["type"] == "study")
-    subjects = _subjects_from_data(req.data or {})
-    goals = await _ml_call("plan-goals", {
-        "user_id": req.user_id,
-        "grade": (req.data or {}).get("grade", "11"),
-        "subjects": subjects,
-        "exams": (req.data or {}).get("exams", []),
-        "daily_study_minutes": max(study_min, 60),
-        "today": _date.today().isoformat(),
-    })
-    weekly = (goals or {}).get("weekly_goals")
-    monthly = (goals or {}).get("monthly_goals")
-    if weekly:
-        user.weekly_goals = weekly
-        user.monthly_goals = monthly
+    # ── DEPRECATED legacy behaviour ────────────────────────────────────────
+    # The old system stored an hourly "day_plan" of Study Session 1/2 slots.
+    # We no longer generate new study-session slots; any plan sent by older
+    # clients is stored read-only for history and is NOT used for planning.
+    if req.plan:
+        user.day_plan = [s.model_dump() for s in req.plan]
 
-    # ---- Persist TODAY's daily plan row (future days regenerate fresh) -----
-    focus = []
-    if weekly:
-        focus = weekly[0].get("topics", [])[:4]
-    varied = await _ml_call("daily-plan", {
-        "user_id": req.user_id,
-        "base_plan": plan_slots,
-        "focus_topics": focus,
-        "date": _date.today().isoformat(),
-        "peak_productivity": (req.data or {}).get("peakProductivity"),
-    })
-    today = _date.today()
-    existing = await db.execute(
-        select(DailyPlan).where(DailyPlan.user_id == req.user_id,
-                                DailyPlan.plan_date == today))
-    row = existing.scalar_one_or_none()
-    slots_out = (varied or {}).get("plan", plan_slots)
-    if row is None:
-        row = DailyPlan(user_id=req.user_id, plan_date=today, week_index=1)
-        db.add(row)
-    row.slots = slots_out
-    row.focus_topics = (varied or {}).get("focus_topics", [])
+    # ── NEW PRIMARY OUTPUT: hierarchical goal plan (deterministic planner) ─
+    # Runs locally (rule-planner-v1). No external AI API is called. If no
+    # approved syllabus exists it returns `syllabus_pending` and invents
+    # nothing; onboarding data is retained while we wait for Segment 2.
+    from app.routers.goals import _build_request, plan
+    from app import goal_service
+    try:
+        out = plan(_build_request(user))
+        phase = out["status"]
+        await goal_service.set_plan_phase(
+            db, req.user_id, phase,
+            pressure_score=out.get("pressure_score", 0),
+            plan_feasibility=out.get("plan_feasibility", "feasible"))
+        if phase == "proposed":
+            await goal_service.store_planner_output(db, req.user_id, out)
+        goals_status = phase
+    except Exception:
+        # Planner failure must never break login/onboarding persistence.
+        await goal_service.set_plan_phase(db, req.user_id, "plan_generating")
+        goals_status = "plan_generating"
+
     await db.commit()
-
     return OnboardingSaveResponse(ok=True, user_id=req.user_id,
-                                  slots_saved=len(slots_out))
+                                  slots_saved=0, plan_status=goals_status)
 
 
 @router.get("/{user_id}", response_model=OnboardingGetResponse)
@@ -110,22 +98,19 @@ async def get_onboarding(user_id: int, db: AsyncSession = Depends(get_db)):
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return OnboardingGetResponse(
-        onboarded=user.day_plan is not None,
+        onboarded=user.onboarding_data is not None,
         data=user.onboarding_data,
-        plan=user.day_plan,
+        plan=user.day_plan,   # legacy read-only; new clients use /api/goals
     )
 
 
 @router.get("/{user_id}/today")
 async def get_today_plan(user_id: int, db: AsyncSession = Depends(get_db)):
-    """NEW-DAY LOGIN ENDPOINT — returns a fresh, personalized timetable.
+    """DEPRECATED fixed-timetable endpoint.
 
-    If today's DailyPlan row already exists we serve it (stable through the
-    day). Otherwise we take the student's stored base routine + their current
-    week's goals and ask the self-hosted ML service to vary the day — so every
-    calendar day looks different (topics rotate, session lengths/order change)
-    while wake/sleep/school/meals stay exactly as the student set them."""
-
+    Kept temporarily for older clients. It no longer generates new study
+    sessions — it serves only the stored legacy routine blocks (read-only).
+    New planning output lives at GET /api/goals/{user_id}/today."""
     today = _date.today()
     row = (await db.execute(
         select(DailyPlan).where(DailyPlan.user_id == user_id,
@@ -134,47 +119,19 @@ async def get_today_plan(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await db.get(User, user_id)
 
     if row is not None:
-        return {
-            "user_id": user_id, "date": today.isoformat(), "generated": False,
-            "plan": row.slots, "focus_topics": row.focus_topics or [],
-            "weekly_goals": (user.weekly_goals if user else None),
-            "monthly_goals": (user.monthly_goals if user else None),
-        }
+        return {"deprecated": True, "user_id": user_id, "date": today.isoformat(),
+                "generated": False, "plan": row.slots,
+                "focus_topics": row.focus_topics or []}
 
     if user is None or not user.day_plan:
-        raise HTTPException(status_code=404, detail="Complete onboarding first")
+        raise HTTPException(status_code=404,
+                            detail="Complete onboarding first; use /api/goals for your learning plan")
 
-    # ---- Generate a brand-new plan for this new day ------------------------
-    weekly = user.weekly_goals or []
-    days_since_start = 0
-    if weekly:
-        try:
-            start = _date.fromisoformat(weekly[0]["start"])
-            days_since_start = max(0, (today - start).days)
-        except Exception:
-            pass
-    week_idx = min(len(weekly) - 1, days_since_start // 7) if weekly else 0
-    week_topics = weekly[week_idx].get("topics", [])[:5] if weekly else []
-
-    varied = await _ml_call("daily-plan", {
-        "user_id": user_id,
-        "base_plan": user.day_plan,
-        "focus_topics": week_topics,
-        "date": today.isoformat(),
-        "peak_productivity": (user.onboarding_data or {}).get("peakProductivity"),
-    })
-    slots_out = (varied or {}).get("plan", user.day_plan)
-    focus_out = (varied or {}).get("focus_topics", [])
-
+    # Serve the stored ROUTINE baseline unchanged (no new study-session fill).
     new_row = DailyPlan(user_id=user_id, plan_date=today,
-                        slots=slots_out, focus_topics=focus_out,
-                        week_index=week_idx + 1)
+                        slots=user.day_plan, focus_topics=[], week_index=1)
     db.add(new_row)
     await db.commit()
-
-    return {
-        "user_id": user_id, "date": today.isoformat(), "generated": True,
-        "plan": slots_out, "focus_topics": focus_out,
-        "weekly_goals": weekly, "monthly_goals": user.monthly_goals,
-        "model": "daily-variation-v1 (self-hosted)",
-    }
+    return {"deprecated": True, "user_id": user_id, "date": today.isoformat(),
+            "generated": True, "plan": user.day_plan, "focus_topics": [],
+            "note": "Fixed timetables are deprecated — see /api/goals/{id}/today"}

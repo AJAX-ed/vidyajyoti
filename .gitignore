@@ -1,6 +1,14 @@
-# Compiled and build artifacts
 __pycache__/
-*.pyc
-
-# Logs and temp files
-*.log
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
